@@ -55,8 +55,10 @@ ORDERS_TABLE = "orders"
 ID_COL = "id"
 STATUS_COL = "status"
 LOG_COL = "processing_log"          # JSON-массив
-DRAWING_PATH_COL = "drawing_path"   # путь файла чертежа внутри бакета DRAWINGS_BUCKET
-RESULT_PATH_COL = "result_path"     # сюда запишем путь готового файла
+DRAWING_PATH_COL = "drawing_url"    # путь файла чертежа внутри бакета DRAWINGS_BUCKET
+RESULT_PATH_COL = "result_url"      # сюда запишем путь готового файла
+STATUS_DONE = "completed"           # статус при успехе (у вас "completed", не "done")
+ERROR_MSG_COL = "error_message"     # сюда пишем текст ошибки
 
 # бакеты хранилища
 DRAWINGS_BUCKET = "drawings"
@@ -342,14 +344,14 @@ def process_order(order_id):
         phase("SAVE", bytes=len(filled))
         path = f"{order_id}.xlsx"
         upload_result(path, filled)
-        db_update(order_id, {RESULT_PATH_COL: path, STATUS_COL: "done"})
+        db_update(order_id, {RESULT_PATH_COL: path, STATUS_COL: STATUS_DONE})
 
         phase("DONE", ms=int((time.time() - t0) * 1000))
     except Exception as e:
         tb = traceback.format_exc()
         log.error("[worker] FATAL %s", tb)
         entries.append({"ts": now_iso(), "step": "ERROR", "message": str(e), "traceback": tb[-1500:]})
-        db_update(order_id, {LOG_COL: entries, STATUS_COL: "error"})
+        db_update(order_id, {LOG_COL: entries, STATUS_COL: "error", ERROR_MSG_COL: str(e)})
 
 
 # ---------------------------------------------------------------------------
