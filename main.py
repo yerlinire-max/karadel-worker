@@ -338,3 +338,29 @@ def process(req: ProcessReq, background: BackgroundTasks,
 
     background.add_task(process_order, req.order_id)
     return JSONResponse(status_code=202, content={"accepted": True})
+              @app.get("/result/{order_id}")
+def get_result(order_id: str):
+    """Прямое скачивание готового файла: отдаёт xlsx из бакета results.
+    Открой в браузере: https://<worker>/result/<order_id>
+    """
+    from fastapi.responses import Response
+    try:
+        order = fetch_order(order_id)
+    except Exception:
+        order = None
+    if not order:
+        raise HTTPException(status_code=404, detail="order not found")
+    path = order.get(RESULT_PATH_COL)
+    if not path:
+        raise HTTPException(status_code=404, detail="result not ready")
+    path = path.lstrip("/").replace("results/", "", 1) if path.startswith("results/") else path.lstrip("/")
+    try:
+        data = sb.storage.from_(RESULTS_BUCKET).download(path)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"file not found: {e}")
+    fname = f"{order.get('order_number') or order_id}.xlsx"
+    return Response(
+        content=data,
+        media_type=XLSX_MIME,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
