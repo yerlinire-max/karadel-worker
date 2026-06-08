@@ -2,6 +2,20 @@
 Karadel calc worker
 ====================
 Небольшой Python-сервис, который снимает с Lovable тяжёлый расчёт.
+
+Поток:
+  Lovable -> POST /process {order_id}   (отвечаем 202 за доли секунды)
+  фоновая задача: скачать чертёж и шаблон из Supabase -> Claude по чертежу
+                  -> заполнить xlsx правкой XML в zip -> залить результат
+                  -> статус заказа = "done"
+
+Ничего не загружает целиком через ExcelJS/openpyxl: правятся ТОЛЬКО
+два листа (sheet1.xml = Расчет, sheet6.xml = Сводная), остальные ~774
+части копируются байт-в-байт. Выпадающие списки и условное
+форматирование (extLst/x14) при этом сохраняются.
+
+Запуск локально:  uvicorn main:app --reload
+Деплой:           Railway (см. Procfile и README.md)
 """
 
 import os
@@ -28,7 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("worker")
 
 # ---------------------------------------------------------------------------
-# КОНФИГ
+# КОНФИГ — подгоните под свою схему Supabase, если имена отличаются
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -36,24 +50,29 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 WORKER_SECRET = os.environ.get("WORKER_SECRET", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
+# таблица заказов и её колонки
 ORDERS_TABLE = "orders"
 ID_COL = "id"
 STATUS_COL = "status"
-LOG_COL = "processing_log"
-DRAWING_PATH_COL = "drawing_url"
-RESULT_PATH_COL = "result_url"
-STATUS_DONE = "completed"
-ERROR_MSG_COL = "error_message"
+LOG_COL = "processing_log"          # JSON-массив
+DRAWING_PATH_COL = "drawing_url"    # путь файла чертежа внутри бакета DRAWINGS_BUCKET
+RESULT_PATH_COL = "result_url"      # сюда запишем путь готового файла
+STATUS_DONE = "completed"           # статус при успехе (у вас "completed", не "done")
+ERROR_MSG_COL = "error_message"     # сюда пишем текст ошибки
 
+# бакеты хранилища
 DRAWINGS_BUCKET = "drawings"
 TEMPLATES_BUCKET = "templates"
 RESULTS_BUCKET = "results"
 
+# путь активного шаблона в бакете TEMPLATES_BUCKET (задаётся env-переменной)
 TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "")
 
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "15"))
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# ВАЖНО: вставьте сюда ваш рабочий промпт распознавания чертежа из Lovable.
+# Главное требование — Claude должен вернуть ТОЛЬКО JSON указанного вида.
 EXTRACTION_PROMPT = """
 Ты — расчётчик металлоконструкций. На изображениях — чертёж (КМ/КМД).
 Извлеки перечень стального проката. Верни СТРОГО JSON без пояснений и без
@@ -73,6 +92,9 @@ sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 app = FastAPI(title="Karadel calc worker")
 
 
+# ---------------------------------------------------------------------------
+# Вспомогательное
+# ---------------------------------------------------------------------------
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -92,6 +114,7 @@ def idx_to_col(idx):
     return s
 
 
+# стальные сортаменты живут в колонках N..BA (40 штук)
 STEEL_COLUMNS = [idx_to_col(i) for i in range(col_to_idx("N"), col_to_idx("BA") + 1)]
 
 
@@ -106,7 +129,7 @@ def db_update(order_id, fields):
 
 def get_template_bytes():
     if not TEMPLATE_PATH:
-        raise RuntimeError("TEMPLATE_PATH не задан")
+        raise RuntimeError("TEMPLATE_PATH не задан (путь активного шаблона в бакете templates)")
     return sb.storage.from_(TEMPLATES_BUCKET).download(TEMPLATE_PATH)
 
 
@@ -118,11 +141,15 @@ def download_drawing(order):
 
 
 def upload_result(path, data):
+    # upsert=true чтобы перезапись при повторном расчёте не падала
     sb.storage.from_(RESULTS_BUCKET).upload(
         path, data, {"content-type": XLSX_MIME, "upsert": "true"}
     )
 
 
+# ---------------------------------------------------------------------------
+# Чертёж -> картинки для Claude
+# ---------------------------------------------------------------------------
 def drawing_to_images(data, filename):
     raw_images = []
     is_pdf = filename.lower().endswith(".pdf") or data[:4] == b"%PDF"
@@ -147,6 +174,9 @@ def drawing_to_images(data, filename):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Claude -> позиции
+# ---------------------------------------------------------------------------
 def parse_json(text):
     t = text.strip()
     t = re.sub(r"^```(?:json)?", "", t).strip()
@@ -173,6 +203,9 @@ def extract_positions(images_b64):
     return parse_json(text)
 
 
+# ---------------------------------------------------------------------------
+# Правка xlsx через zip (без ExcelJS / openpyxl-save)
+# ---------------------------------------------------------------------------
 def _build_cell(ref, attrs, value, kind):
     m = re.search(r'\bs="(\d+)"', attrs or "")
     s = f' s="{m.group(1)}"' if m else ""
@@ -187,10 +220,12 @@ def set_cell(xml, ref, value, kind):
     row = re.search(r"\d+", ref).group()
     col_idx = col_to_idx(col)
 
+    # 1) ячейка уже есть -> заменить, сохранив её стиль (s=)
     pat = re.compile(r'<c r="' + ref + r'"([^>]*?)(?:/>|>.*?</c>)', re.S)
     if pat.search(xml):
         return pat.sub(lambda m: _build_cell(ref, m.group(1), value, kind), xml, count=1)
 
+    # 2) ячейки нет -> вставить в нужную строку в порядке колонок
     rowpat = re.compile(r'(<row r="' + row + r'"[^>]*>)(.*?)(</row>)', re.S)
     m = rowpat.search(xml)
     new_cell = _build_cell(ref, "", value, kind)
@@ -216,6 +251,8 @@ def ensure_full_calc(wb):
 
 
 def match_sortament(name):
+    # TODO: здесь будет подбор по «Сводной» + аналоги + раскраска (отдельные правила).
+    # Пока что имя проходит как есть.
     return (name or "").strip()
 
 
@@ -252,10 +289,13 @@ def fill_template(xlsx_bytes, positions, drawing_name):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
-    s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")
+    s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")  # Расчет
     for ref, (val, kind) in build_raschet_cells(positions, drawing_name).items():
         s1 = set_cell(s1, ref, val, kind)
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
+
+    # TODO: правка sheet6.xml (Сводная) — добавление недостающих сортаментов.
+    # parts["xl/worksheets/sheet6.xml"] правится тем же set_cell.
 
     wb = parts["xl/workbook.xml"].decode("utf-8")
     parts["xl/workbook.xml"] = ensure_full_calc(wb).encode("utf-8")
@@ -268,6 +308,9 @@ def fill_template(xlsx_bytes, positions, drawing_name):
     return out.getvalue()
 
 
+# ---------------------------------------------------------------------------
+# Фоновая обработка
+# ---------------------------------------------------------------------------
 def process_order(order_id):
     order = fetch_order(order_id)
     entries = order.get(LOG_COL) or []
@@ -311,6 +354,9 @@ def process_order(order_id):
         db_update(order_id, {LOG_COL: entries, STATUS_COL: "error", ERROR_MSG_COL: str(e)})
 
 
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 class ProcessReq(BaseModel):
     order_id: str
 
@@ -338,7 +384,9 @@ def process(req: ProcessReq, background: BackgroundTasks,
 
     background.add_task(process_order, req.order_id)
     return JSONResponse(status_code=202, content={"accepted": True})
-              @app.get("/result/{order_id}")
+
+
+@app.get("/result/{order_id}")
 def get_result(order_id: str):
     """Прямое скачивание готового файла: отдаёт xlsx из бакета results.
     Открой в браузере: https://<worker>/result/<order_id>
