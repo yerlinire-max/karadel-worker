@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v3-spec-table-check-2026-06-09"
+WORKER_VERSION = "v4-svodnaya-match-2026-06-09"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -307,9 +307,111 @@ def ensure_full_calc(wb):
     return re.sub(r"(</sheets>)", r'\1<calcPr fullCalcOnLoad="1"/>', wb, count=1)
 
 
+def read_svodnaya_names(xlsx_bytes):
+    """Читает названия материалов из листа «Сводная» (столбец C, кэш-значения формул)."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+        data = z.read("xl/worksheets/sheet6.xml").decode("utf-8")
+    except Exception:
+        return []
+    out = []
+    for m in re.finditer(r'<c r="C(\d+)"[^>]*>(?:<f>[^<]*</f>)?<v>([^<]*)</v></c>', data):
+        val = m.group(2)
+        if val and any(ch.isalpha() for ch in val):
+            out.append(val)
+    return out
+
+
+def _parse_profile(name):
+    """(тип, [размеры], марка, подтип) из названия — нашего или из «Сводной»."""
+    s = name.lower().replace("ё", "е")
+    grade = "09Г2С" if "09г2с" in s else ("ст3" if ("ст 3" in s or "ст3" in s) else None)
+
+    def nums(txt):
+        txt = re.sub(r"(\d),(\d)", r"\1.\2", txt)  # 4,0 -> 4.0
+        return [float(x) for x in re.findall(r"\d+(?:\.\d+)?", txt)]
+
+    if "швеллер" in s:
+        return ("ШВЕЛЛЕР", nums(s.split(",")[0].replace("швеллер", ""))[:1], grade, None)
+    if "уголок" in s:
+        return ("УГОЛОК", nums(s.split("уголок")[1].split(",")[0])[:2], grade, None)
+    if "лист" in s:
+        body = s.split("лист")[1].split(",")[0].replace("ст 3", "").replace("t", "")
+        return ("ЛИСТ", nums(body)[:1], grade, None)
+    if "балка" in s or "двутавр" in s:
+        after = s.split("балка")[-1] if "балка" in s else s.split("двутавр")[-1]
+        m_our = re.search(r"(\d+)\s*([кбш])", after)  # наш формат "30к1"
+        if m_our:
+            return ("БАЛКА", [float(m_our.group(1))], grade, m_our.group(2).upper())
+        m_sub = re.match(r"\s*([кбшм])\b", after)      # Сводная "к-1, 30"
+        sub = m_sub.group(1).upper() if m_sub else None
+        size = None
+        for part in after.split(",")[1:]:
+            d = re.findall(r"\d+", part)
+            if d:
+                size = float(d[0]); break
+        return ("БАЛКА", [size] if size else [], grade, sub)
+    if "труб" in s:
+        is_prof = "проф" in s
+        body = re.sub(r"(\d),(\d)", r"\1.\2", s).split(",")[0]  # отрезать ", 12м"
+        n = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", body)]
+        if is_prof:
+            return ("ТРУБА_ПРОФ", ([n[0], n[-1]] if len(n) >= 2 else n), grade, None)
+        return ("ТРУБА_КРУГ", n, grade, None)
+    return ("?", [], grade, None)
+
+
+def build_svodnaya_index(names):
+    index = {}
+    for nm in names:
+        p = _parse_profile(nm)
+        index.setdefault(p[0], []).append((p, nm))
+    return index
+
+
+def resolve_to_svodnaya(name, grade, index):
+    """Возвращает (имя_из_Сводной, способ). способ: 'точно' | 'аналог' | 'нет'."""
+    p = _parse_profile(name)
+    typ, dims, _, sub = p
+    cands = index.get(typ, [])
+    if not cands:
+        return name, "нет"
+    want = "09Г2С" if typ == "ЛИСТ" else ("09Г2С" if grade == "С345" and typ == "УГОЛОК" else None)
+
+    def gpref(lst):
+        if want:
+            g = [x for x in lst if x[0][2] == want]
+            if g:
+                return g
+        ng = [x for x in lst if x[0][2] in (None, "ст3")]
+        return ng or lst
+
+    def same_sub(pp):
+        return not (typ == "БАЛКА" and sub and pp[3] and pp[3] != sub)
+
+    exact = [(pp, nm) for pp, nm in cands if pp[1] == dims and same_sub(pp)]
+    if exact:
+        return gpref(exact)[0][1], "точно"
+
+    # ближайший больший
+    if typ == "ТРУБА_ПРОФ" and len(dims) >= 2:
+        side, wall = dims
+        sw = [(pp[1][0], nm) for pp, nm in cands if len(pp[1]) >= 2 and pp[1][1] == wall and pp[1][0] >= side]
+        if sw:
+            return min(sw)[1], "аналог"
+        any_ = [(pp[1][0], nm) for pp, nm in cands if pp[1] and pp[1][0] >= side]
+        if any_:
+            return min(any_)[1], "аналог"
+    else:
+        big = sorted([(pp[1][0], pp, nm) for pp, nm in cands if pp[1] and dims and pp[1][0] >= dims[0] and same_sub(pp)], key=lambda x: x[0])
+        big = gpref([(pp, nm) for _, pp, nm in big])
+        if big:
+            return big[0][1], "аналог"
+    return name, "нет"
+
+
 def match_sortament(name):
-    # TODO: здесь будет подбор по «Сводной» + аналоги + раскраска (отдельные правила).
-    # Пока что имя проходит как есть.
+    # подбор по «Сводной» выполняется в build_raschet_cells (нужен индекс).
     return (name or "").strip()
 
 
@@ -320,32 +422,37 @@ def _norm_key(name):
     return s
 
 
-def build_raschet_cells(positions, drawing_name):
+def build_raschet_cells(positions, drawing_name, svod_index=None):
     cells = {
         "C6": ("Металлоконструкции", "s"),
         "D6": (drawing_name or "", "s"),
         "I6": ("шт", "s"),
         "J6": (1, "n"),
     }
-    agg, display, order = {}, {}, []
+    agg, display, order, notes = {}, {}, [], []
     for p in positions:
         raw = match_sortament(p.get("sortament") or p.get("name") or "")
         if not raw:
             continue
-        # масса обязательна: без массы — это мусор/галлюцинация, пропускаем
         try:
             mass = float(p.get("mass_kg") or p.get("mass") or 0)
         except (TypeError, ValueError):
             mass = 0.0
         if mass <= 0:
             continue
-        key = _norm_key(raw)
+        grade = str(p.get("grade") or "")
+        # подбор имени из «Сводной» (точное или ближайший аналог)
+        if svod_index:
+            resolved, how = resolve_to_svodnaya(raw, grade, svod_index)
+        else:
+            resolved, how = raw, "нет-индекса"
+        if how in ("аналог", "нет"):
+            notes.append({"исходное": raw, "подставлено": resolved, "тип": how})
+        key = _norm_key(resolved)
         if key not in agg:
             agg[key] = 0.0
-            display[key] = raw          # показываем первое встреченное имя
+            display[key] = resolved
             order.append(key)
-        # один профиль из разных таблиц не суммируем (избегаем двойного счёта):
-        # берём максимум — это и есть итог из сводной спецификации
         agg[key] = max(agg[key], mass)
     total = 0.0
     for i, key in enumerate(order):
@@ -356,20 +463,20 @@ def build_raschet_cells(positions, drawing_name):
         cells[f"{c}6"] = (round(agg[key], 2), "n")
         total += agg[key]
     cells["K6"] = (round(total, 2), "n")
-    return cells
+    return cells, notes
 
 
 def fill_template(xlsx_bytes, positions, drawing_name):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
+    svod_index = build_svodnaya_index(read_svodnaya_names(xlsx_bytes))
+
     s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")  # Расчет
-    for ref, (val, kind) in build_raschet_cells(positions, drawing_name).items():
+    cells, notes = build_raschet_cells(positions, drawing_name, svod_index)
+    for ref, (val, kind) in cells.items():
         s1 = set_cell(s1, ref, val, kind)
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
-
-    # TODO: правка sheet6.xml (Сводная) — добавление недостающих сортаментов.
-    # parts["xl/worksheets/sheet6.xml"] правится тем же set_cell.
 
     wb = parts["xl/workbook.xml"].decode("utf-8")
     parts["xl/workbook.xml"] = ensure_full_calc(wb).encode("utf-8")
@@ -379,7 +486,7 @@ def fill_template(xlsx_bytes, positions, drawing_name):
     for zi in zin.infolist():
         zout.writestr(zi, parts[zi.filename])
     zout.close()
-    return out.getvalue()
+    return out.getvalue(), notes
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +551,9 @@ def process_order(order_id):
 
         phase("FILL_EXCEL")
         drawing_name = data.get("drawing") or order.get(DRAWING_PATH_COL, "")
-        filled = fill_template(tpl, positions, drawing_name)
+        filled, notes = fill_template(tpl, positions, drawing_name)
+        if notes:
+            phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
 
         phase("SAVE", bytes=len(filled))
         path = f"{order_id}.xlsx"
