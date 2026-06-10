@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v8d-price-perkg-2026-06-10"
+WORKER_VERSION = "v8f-canon-tube-2026-06-10"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -638,8 +638,26 @@ def resolve_to_svodnaya(name, grade, index):
 
 
 def match_sortament(name):
-    # подбор по «Сводной» выполняется в build_raschet_cells (нужен индекс).
-    return (name or "").strip()
+    # Канонизация имени профильной трубы к единому виду «Труба проф A*B*C»
+    # (как в «Сводной»): слово «Труба проф», размеры через «*», квадрат из двух
+    # чисел (250x6) разворачивается в три (250*250*6). Совпадение с ключом
+    # справочника и ячейкой файла гарантируется одинаковым написанием везде.
+    s = (name or "").strip()
+    low = s.lower()
+    if "труб" in low and "проф" in low:
+        head = s.split(",")[0]
+        tail = s[len(head):]                       # сохранить «, 12м» если было
+        nums = re.findall(r"\d+(?:[.,]\d+)?", head)
+        if len(nums) == 2:                         # квадрат «250x6» -> 250*250*6
+            a, t = nums
+            dims = [a, a, t]
+        elif len(nums) >= 3:                       # прямоугольный 160x120x4
+            dims = nums[:3]
+        else:
+            dims = None
+        if dims:
+            s = "Труба проф " + "*".join(dims) + tail
+    return s
 
 
 def _norm_key(name):
