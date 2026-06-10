@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v8c-catalog-fix-2026-06-10"
+WORKER_VERSION = "v8d-price-perkg-2026-06-10"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -851,12 +851,14 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
     s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
     s6_changed = False
 
-    def put_price(nm, price):
-        """Проставить цену материалу: есть в «Сводной» -> переписать G;
-        нет -> добавить в свободную строку. Возвращает True, если что-то записал."""
+    def put_price(nm, price_per_kg):
+        """Проставить цену материалу. Менеджер вводит цену ЗА КГ, а «Сводная»
+        хранит цену ЗА ТОННУ (формула «Расчёта» делит на 1000) — поэтому ×1000.
+        Есть в «Сводной» -> переписать G; нет -> добавить в свободную строку."""
         nonlocal s6, s6_changed
-        if price is None:
+        if price_per_kg is None:
             return False
+        price = price_per_kg * 1000          # за кг -> за тонну
         row = name_to_row.get(nm)
         if row is None:
             row = next(free_iter, None)
