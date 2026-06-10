@@ -57,6 +57,8 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 # таблица заказов и её колонки
 ORDERS_TABLE = "orders"
 ID_COL = "id"
+OVERRIDES_TABLE = "order_overrides"   # ручные цены менеджера по заявке
+CATALOG_TABLE = "catalog_overrides"   # глобальные цены справочника (на все заявки)
 STATUS_COL = "status"
 LOG_COL = "processing_log"          # JSON-массив
 DRAWING_PATH_COL = "drawing_url"    # путь файла чертежа внутри бакета DRAWINGS_BUCKET
@@ -209,6 +211,36 @@ def fetch_order(order_id):
 
 def db_update(order_id, fields):
     sb.table(ORDERS_TABLE).update(fields).eq(ID_COL, order_id).execute()
+
+
+def load_overrides(order_id):
+    """Ручные цены менеджера для заявки: {имя_материала: цена_за_кг}."""
+    out = {}
+    try:
+        res = sb.table(OVERRIDES_TABLE).select("match_name, price").eq("order_id", order_id).execute()
+        for row in (res.data or []):
+            nm = (row.get("match_name") or "").strip()
+            pr = row.get("price")
+            if nm and pr is not None:
+                out[nm] = float(pr)
+    except Exception as e:
+        log.error("[load_overrides] не удалось прочитать ручные цены: %s", e)
+    return out
+
+
+def load_catalog_overrides():
+    """Глобальные цены справочника (на все заявки): {имя_материала: цена_за_кг}."""
+    out = {}
+    try:
+        res = sb.table(CATALOG_TABLE).select("match_name, price").execute()
+        for row in (res.data or []):
+            nm = (row.get("match_name") or "").strip()
+            pr = row.get("price")
+            if nm and pr is not None:
+                out[nm] = float(pr)
+    except Exception as e:
+        log.error("[load_catalog] не удалось прочитать справочник цен: %s", e)
+    return out
 
 
 def log_run(*, drawing_name, check_status,
@@ -729,7 +761,47 @@ def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None
     return cells, notes, dopisat, summary
 
 
-def fill_template(xlsx_bytes, positions, drawing_name):
+def apply_catalog_to_template(xlsx_bytes, catalog):
+    """Применяет глобальные цены справочника к «Сводной» шаблона ДО заполнения.
+    Цена есть в «Сводной» -> перезаписываем; нет -> добавляем в свободную строку.
+    Структура файла сохраняется (правка XML); при ошибке возвращаем исходный шаблон."""
+    if not catalog:
+        return xlsx_bytes
+    try:
+        entries, free_rows = read_svodnaya_full(xlsx_bytes)
+        zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+        parts = {n: zin.read(n) for n in zin.namelist()}
+        name_to_row = {nm: r for r, nm, _ in entries}
+        free_iter = iter(free_rows)
+        s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
+        changed = False
+        for nm, price in catalog.items():
+            if price is None:
+                continue
+            row = name_to_row.get(nm)
+            if row is None:
+                row = next(free_iter, None)
+                if row is None:
+                    continue
+                s6 = set_cell(s6, f"C{row}", nm, "s")
+                name_to_row[nm] = row
+            s6 = set_cell(s6, f"G{row}", price, "n")
+            changed = True
+        if not changed:
+            return xlsx_bytes
+        parts["xl/worksheets/sheet6.xml"] = s6.encode("utf-8")
+        out = io.BytesIO()
+        zout = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+        for zi in zin.infolist():
+            zout.writestr(zi, parts[zi.filename])
+        zout.close()
+        return out.getvalue()
+    except Exception as e:
+        log.error("[catalog] не удалось применить справочник к шаблону: %s", e)
+        return xlsx_bytes
+
+
+def fill_template(xlsx_bytes, positions, drawing_name, overrides=None):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
@@ -773,13 +845,42 @@ def fill_template(xlsx_bytes, positions, drawing_name):
     parts["xl/styles.xml"] = styles.encode("utf-8")
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
 
-    # дозапись оранжевых в «Сводную» (реальное имя + цена аналога) в свободные строки
-    if dopisat and free_rows:
-        s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
-        for (real_name, price), row in zip(dopisat, list(free_rows)):
-            s6 = set_cell(s6, f"C{row}", real_name, "s")
-            if price is not None:
-                s6 = set_cell(s6, f"G{row}", price, "n")
+    # запись в «Сводную»: новые материалы (оранжевые) + ручные цены менеджера
+    overrides = overrides or {}
+    name_to_row = {nm: r for r, nm, _ in entries}
+    free_iter = iter(free_rows)
+    s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
+    s6_changed = False
+
+    # 1) новые материалы (оранжевые/трубы), которых ещё нет в «Сводной»
+    for real_name, price in dopisat:
+        if real_name in name_to_row:
+            continue
+        row = next(free_iter, None)
+        if row is None:
+            break
+        s6 = set_cell(s6, f"C{row}", real_name, "s")
+        name_to_row[real_name] = row
+        if price is not None:
+            s6 = set_cell(s6, f"G{row}", price, "n")
+        s6_changed = True
+
+    # 2) ручные цены менеджера — перекрывают цену для ЭТОЙ заявки
+    #    (есть в «Сводной» -> переписываем цену; нет -> добавляем в свободную строку)
+    for nm, price in overrides.items():
+        if price is None:
+            continue
+        row = name_to_row.get(nm)
+        if row is None:
+            row = next(free_iter, None)
+            if row is None:
+                continue
+            s6 = set_cell(s6, f"C{row}", nm, "s")
+            name_to_row[nm] = row
+        s6 = set_cell(s6, f"G{row}", price, "n")
+        s6_changed = True
+
+    if s6_changed:
         parts["xl/worksheets/sheet6.xml"] = s6.encode("utf-8")
 
     wb = parts["xl/workbook.xml"].decode("utf-8")
@@ -824,6 +925,7 @@ def process_order(order_id):
     try:
         phase("LOAD_TEMPLATE")
         tpl = get_template_bytes()
+        tpl = apply_catalog_to_template(tpl, load_catalog_overrides())
 
         phase("LOAD_DRAWING")
         draw = download_drawing(order)
@@ -870,7 +972,8 @@ def process_order(order_id):
 
         phase("FILL_EXCEL")
         drawing_name = data.get("drawing") or order.get(DRAWING_PATH_COL, "")
-        filled, notes, summary = fill_template(tpl, positions, drawing_name)
+        overrides = load_overrides(order_id)
+        filled, notes, summary = fill_template(tpl, positions, drawing_name, overrides)
         if notes:
             phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
         review_total = summary["yellow"] + summary["orange"] + summary["red"]
