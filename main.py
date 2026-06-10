@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v8-prices-angles-2026-06-10"
+WORKER_VERSION = "v8b-catalog-debug-2026-06-10"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -229,17 +229,15 @@ def load_overrides(order_id):
 
 
 def load_catalog_overrides():
-    """Глобальные цены справочника (на все заявки): {имя_материала: цена_за_кг}."""
+    """Глобальные цены справочника (на все заявки): {имя_материала: цена_за_кг}.
+    Ошибку НЕ глушим — пусть всплывёт в лог обработки (CATALOG_ERROR)."""
     out = {}
-    try:
-        res = sb.table(CATALOG_TABLE).select("match_name, price").execute()
-        for row in (res.data or []):
-            nm = (row.get("match_name") or "").strip()
-            pr = row.get("price")
-            if nm and pr is not None:
-                out[nm] = float(pr)
-    except Exception as e:
-        log.error("[load_catalog] не удалось прочитать справочник цен: %s", e)
+    res = sb.table(CATALOG_TABLE).select("match_name, price").execute()
+    for row in (res.data or []):
+        nm = (row.get("match_name") or "").strip()
+        pr = row.get("price")
+        if nm and pr is not None:
+            out[nm] = float(pr)
     return out
 
 
@@ -925,7 +923,13 @@ def process_order(order_id):
     try:
         phase("LOAD_TEMPLATE")
         tpl = get_template_bytes()
-        tpl = apply_catalog_to_template(tpl, load_catalog_overrides())
+        try:
+            catalog = load_catalog_overrides()
+            phase("CATALOG_LOADED", count=len(catalog), names=list(catalog.keys())[:20])
+        except Exception as e:
+            catalog = {}
+            phase("CATALOG_ERROR", error=str(e)[:300])
+        tpl = apply_catalog_to_template(tpl, catalog)
 
         phase("LOAD_DRAWING")
         draw = download_drawing(order)
