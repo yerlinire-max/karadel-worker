@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v8b-catalog-debug-2026-06-10"
+WORKER_VERSION = "v8c-catalog-fix-2026-06-10"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -799,7 +799,7 @@ def apply_catalog_to_template(xlsx_bytes, catalog):
         return xlsx_bytes
 
 
-def fill_template(xlsx_bytes, positions, drawing_name, overrides=None):
+def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
@@ -843,12 +843,30 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None):
     parts["xl/styles.xml"] = styles.encode("utf-8")
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
 
-    # запись в «Сводную»: новые материалы (оранжевые) + ручные цены менеджера
+    # запись в «Сводную»: новые материалы (оранжевые) + справочник + цены заявки
     overrides = overrides or {}
+    catalog = catalog or {}
     name_to_row = {nm: r for r, nm, _ in entries}
     free_iter = iter(free_rows)
     s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
     s6_changed = False
+
+    def put_price(nm, price):
+        """Проставить цену материалу: есть в «Сводной» -> переписать G;
+        нет -> добавить в свободную строку. Возвращает True, если что-то записал."""
+        nonlocal s6, s6_changed
+        if price is None:
+            return False
+        row = name_to_row.get(nm)
+        if row is None:
+            row = next(free_iter, None)
+            if row is None:
+                return False
+            s6 = set_cell(s6, f"C{row}", nm, "s")
+            name_to_row[nm] = row
+        s6 = set_cell(s6, f"G{row}", price, "n")
+        s6_changed = True
+        return True
 
     # 1) новые материалы (оранжевые/трубы), которых ещё нет в «Сводной»
     for real_name, price in dopisat:
@@ -863,20 +881,13 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None):
             s6 = set_cell(s6, f"G{row}", price, "n")
         s6_changed = True
 
-    # 2) ручные цены менеджера — перекрывают цену для ЭТОЙ заявки
-    #    (есть в «Сводной» -> переписываем цену; нет -> добавляем в свободную строку)
+    # 2) справочник (на все заявки)
+    for nm, price in catalog.items():
+        put_price(nm, price)
+
+    # 3) ручные цены менеджера по заявке — перекрывают справочник
     for nm, price in overrides.items():
-        if price is None:
-            continue
-        row = name_to_row.get(nm)
-        if row is None:
-            row = next(free_iter, None)
-            if row is None:
-                continue
-            s6 = set_cell(s6, f"C{row}", nm, "s")
-            name_to_row[nm] = row
-        s6 = set_cell(s6, f"G{row}", price, "n")
-        s6_changed = True
+        put_price(nm, price)
 
     if s6_changed:
         parts["xl/worksheets/sheet6.xml"] = s6.encode("utf-8")
@@ -929,7 +940,6 @@ def process_order(order_id):
         except Exception as e:
             catalog = {}
             phase("CATALOG_ERROR", error=str(e)[:300])
-        tpl = apply_catalog_to_template(tpl, catalog)
 
         phase("LOAD_DRAWING")
         draw = download_drawing(order)
@@ -977,7 +987,7 @@ def process_order(order_id):
         phase("FILL_EXCEL")
         drawing_name = data.get("drawing") or order.get(DRAWING_PATH_COL, "")
         overrides = load_overrides(order_id)
-        filled, notes, summary = fill_template(tpl, positions, drawing_name, overrides)
+        filled, notes, summary = fill_template(tpl, positions, drawing_name, overrides, catalog)
         if notes:
             phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
         review_total = summary["yellow"] + summary["orange"] + summary["red"]
