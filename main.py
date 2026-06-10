@@ -187,6 +187,34 @@ def db_update(order_id, fields):
     sb.table(ORDERS_TABLE).update(fields).eq(ID_COL, order_id).execute()
 
 
+def log_run(*, drawing_name, check_status,
+            positions_count=None, sum_mass=None, expected_total=None,
+            review=None, cost_cents=None, request_id=None, log_text=None):
+    """Пишет одну строку-журнал в worker_runs по итогам обработки чертежа.
+    Никогда не роняет основную обработку: ошибку журнала просто логируем."""
+    review = review or {}
+    payload = {
+        "drawing_name":   drawing_name,
+        "request_id":     request_id,
+        "worker_version": WORKER_VERSION,
+        "model":          CLAUDE_MODEL,
+        "check_status":   check_status,        # "OK" / "MISMATCH" / "NO_CONTROL"
+        "positions_count": positions_count,
+        "sum_mass":       sum_mass,
+        "expected_total": expected_total,
+        "review_total":   review.get("total"),
+        "review_yellow":  review.get("yellow"),
+        "review_orange":  review.get("orange"),
+        "review_red":     review.get("red"),
+        "cost_cents":     cost_cents,
+        "log_text":       log_text,
+    }
+    try:
+        sb.table("worker_runs").insert(payload).execute()
+    except Exception as e:
+        log.error("[log_run] не удалось записать журнал прогона: %s", e)
+
+
 def get_template_bytes():
     if not TEMPLATE_PATH:
         raise RuntimeError("TEMPLATE_PATH не задан (путь активного шаблона в бакете templates)")
@@ -732,6 +760,20 @@ def process_order(order_id):
 
         phase("DONE", ms=int((time.time() - t0) * 1000),
               needs_review=needs_review, mass_check=check)
+
+        log_run(
+            drawing_name    = drawing_name,
+            request_id      = order_id,
+            check_status    = "OK" if check.get("ok") is True
+                              else ("MISMATCH" if check.get("ok") is False else "NO_CONTROL"),
+            positions_count = len(positions),
+            sum_mass        = sum_mass,
+            expected_total  = control,
+            review          = {"total":  review_total,
+                               "yellow": summary["yellow"],
+                               "orange": summary["orange"],
+                               "red":    summary["red"]},
+        )
     except Exception as e:
         tb = traceback.format_exc()
         log.error("[worker] FATAL %s", tb)
