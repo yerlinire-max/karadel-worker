@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v4-svodnaya-match-2026-06-09"
+WORKER_VERSION = "v6-colors-dopisat-2026-06-09"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -122,10 +122,13 @@ EXTRACTION_PROMPT = """
 - grade: марка стали.
 - mass_kg: число из «Общая масса кг» (обязательно).
 - qty: если есть, иначе пропусти.
+- uncertain: true, ЕСЛИ ты не уверен в этой позиции (чертёж размыт, цифры/название
+  плохо читаются, неоднозначно). НЕ ФАНТАЗИРУЙ — лучше поставь uncertain:true.
+  Если всё чётко — uncertain:false или не указывай.
 
 ЗАПРЕЩЕНО: выдумывать профили/размеры/массы, использовать римские цифры,
 повторять один и тот же размер дважды, включать позиции без массы.
-Если число не разобрать — пропусти позицию.
+Если число не разобрать — поставь uncertain:true (НЕ угадывай значение).
 
 Самопроверка: сумма всех mass_kg должна примерно совпасть с «Итого масса металла»
 из таблицы. Если сильно расходится — перечитай столбец «Общая масса кг».
@@ -263,29 +266,32 @@ def extract_positions(images_b64):
 # ---------------------------------------------------------------------------
 # Правка xlsx через zip (без ExcelJS / openpyxl-save)
 # ---------------------------------------------------------------------------
-def _build_cell(ref, attrs, value, kind):
-    m = re.search(r'\bs="(\d+)"', attrs or "")
-    s = f' s="{m.group(1)}"' if m else ""
+def _build_cell(ref, attrs, value, kind, style_id=None):
+    if style_id is not None:
+        s = f' s="{style_id}"'
+    else:
+        m = re.search(r'\bs="(\d+)"', attrs or "")
+        s = f' s="{m.group(1)}"' if m else ""
     if kind == "n":
         return f'<c r="{ref}"{s}><v>{value}</v></c>'
     text = escape(str(value))
     return f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
 
 
-def set_cell(xml, ref, value, kind):
+def set_cell(xml, ref, value, kind, style_id=None):
     col = re.match(r"[A-Z]+", ref).group()
     row = re.search(r"\d+", ref).group()
     col_idx = col_to_idx(col)
 
-    # 1) ячейка уже есть -> заменить, сохранив её стиль (s=)
+    # 1) ячейка уже есть -> заменить
     pat = re.compile(r'<c r="' + ref + r'"([^>]*?)(?:/>|>.*?</c>)', re.S)
     if pat.search(xml):
-        return pat.sub(lambda m: _build_cell(ref, m.group(1), value, kind), xml, count=1)
+        return pat.sub(lambda m: _build_cell(ref, m.group(1), value, kind, style_id), xml, count=1)
 
     # 2) ячейки нет -> вставить в нужную строку в порядке колонок
     rowpat = re.compile(r'(<row r="' + row + r'"[^>]*>)(.*?)(</row>)', re.S)
     m = rowpat.search(xml)
-    new_cell = _build_cell(ref, "", value, kind)
+    new_cell = _build_cell(ref, "", value, kind, style_id)
     if not m:
         return xml.replace("</sheetData>", f'<row r="{row}">{new_cell}</row></sheetData>', 1)
     head, body, tail = m.group(1), m.group(2), m.group(3)
@@ -296,6 +302,61 @@ def set_cell(xml, ref, value, kind):
             break
     body = body[:insert_pos] + new_cell + body[insert_pos:]
     return xml[:m.start()] + head + body + tail + xml[m.end():]
+
+
+def _split_xfs(body):
+    """Аккуратно разбивает cellXfs на отдельные <xf> (учёт самозакрытия и <alignment>)."""
+    xfs = []
+    for m in re.finditer(r'<xf\b', body):
+        start = m.start()
+        rest = body[start:]
+        gt = rest.find(">")
+        if gt > 0 and rest[gt - 1] == "/":
+            end = start + gt + 1
+        else:
+            close = rest.find("</xf>")
+            end = start + close + len("</xf>")
+        xfs.append(body[start:end])
+    return xfs
+
+
+def _ensure_red_fill(styles_xml):
+    """Гарантирует наличие красной заливки в палитре. Возвращает (xml, fill_id)."""
+    m = re.search(r'(<fills count=")(\d+)(">)(.*?)(</fills>)', styles_xml, re.S)
+    body = m.group(4)
+    # уже есть красная (FFFF0000)?
+    fills = re.findall(r"<fill>.*?</fill>", body, re.S)
+    for i, f in enumerate(fills):
+        if 'rgb="FFFF0000"' in f:
+            return styles_xml, i
+    red = '<fill><patternFill patternType="solid"><fgColor rgb="FFFF0000"/><bgColor indexed="64"/></patternFill></fill>'
+    new_id = len(fills)
+    styles_xml = (styles_xml[:m.start()] + m.group(1) + str(int(m.group(2)) + 1) + m.group(3)
+                  + body + red + m.group(5) + styles_xml[m.end():])
+    return styles_xml, new_id
+
+
+def add_marker_style(styles_xml, fill_id, base_index=374):
+    """Добавляет в cellXfs стиль = базовый(374) + заливка fill_id. Возвращает (xml, индекс)."""
+    m = re.search(r'(<cellXfs count=")(\d+)(">)(.*?)(</cellXfs>)', styles_xml, re.S)
+    if not m:
+        return styles_xml, None
+    body = m.group(4)
+    xfs = _split_xfs(body)
+    base = xfs[base_index] if base_index < len(xfs) else '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    new = base
+    if 'fillId="' in new:
+        new = re.sub(r'fillId="\d+"', f'fillId="{fill_id}"', new, count=1)
+    else:
+        new = new.replace("<xf", f'<xf fillId="{fill_id}"', 1)
+    if "applyFill=" in new:
+        new = re.sub(r'applyFill="\d"', 'applyFill="1"', new, count=1)
+    else:
+        new = new.replace("<xf", '<xf applyFill="1"', 1)
+    new_index = len(xfs)
+    styles_xml = (styles_xml[:m.start()] + m.group(1) + str(int(m.group(2)) + 1) + m.group(3)
+                  + body + new + m.group(5) + styles_xml[m.end():])
+    return styles_xml, new_index
 
 
 def ensure_full_calc(wb):
@@ -309,17 +370,45 @@ def ensure_full_calc(wb):
 
 def read_svodnaya_names(xlsx_bytes):
     """Читает названия материалов из листа «Сводная» (столбец C, кэш-значения формул)."""
+    entries, _ = read_svodnaya_full(xlsx_bytes)
+    return [nm for _, nm, _ in entries]
+
+
+def read_svodnaya_full(xlsx_bytes):
+    """Возвращает ([(row, name, price)], [free_rows]) из листа «Сводная» (C=имя, G=цена)."""
     try:
         z = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
-        data = z.read("xl/worksheets/sheet6.xml").decode("utf-8")
+        s6 = z.read("xl/worksheets/sheet6.xml").decode("utf-8")
     except Exception:
-        return []
-    out = []
-    for m in re.finditer(r'<c r="C(\d+)"[^>]*>(?:<f>[^<]*</f>)?<v>([^<]*)</v></c>', data):
-        val = m.group(2)
-        if val and any(ch.isalpha() for ch in val):
-            out.append(val)
-    return out
+        return [], []
+
+    def cv(ref):
+        m = re.search(r'<c r="' + ref + r'"[^>]*?>(?:<f>[^<]*</f>)?<v>([^<]*)</v>', s6)
+        return m.group(1) if m else None
+
+    entries, free = [], []
+    for r in range(8, 621):
+        c = cv(f"C{r}")
+        if c and any(ch.isalpha() for ch in c):
+            g = cv(f"G{r}")
+            try:
+                price = float(g)
+            except (TypeError, ValueError):
+                price = None
+            entries.append((r, c, price))
+        elif c is None:
+            free.append(r)
+    return entries, free
+
+
+def make_real_name(real_size, analog_name, typ):
+    """Подставляет реальный размер в формат имени аналога (для дозаписи в «Сводную»)."""
+    real = int(real_size) if float(real_size).is_integer() else real_size
+    if typ == "БАЛКА":
+        return re.sub(r"(,\s*)\d+", lambda m: m.group(1) + str(real), analog_name, count=1)
+    if typ == "ТРУБА_ПРОФ":
+        return re.sub(r"\d+х\d+", f"{real}х{real}", analog_name, count=1)
+    return re.sub(r"\d+", str(real), analog_name, count=1)
 
 
 def _parse_profile(name):
@@ -422,14 +511,24 @@ def _norm_key(name):
     return s
 
 
-def build_raschet_cells(positions, drawing_name, svod_index=None):
+def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None):
+    """
+    Возвращает (cells, notes, dopisat, summary).
+    cells[ref] = (значение, тип, mark)  где mark = None | "yellow" | "orange" | "red"
+    comment-ячейки (строка 7) тоже в cells (без цвета).
+    dopisat = [(имя, цена)] — что дописать в «Сводную» (оранжевые).
+    summary = {"yellow":n,"orange":n,"red":n}
+    """
+    price_map = price_map or {}
     cells = {
-        "C6": ("Металлоконструкции", "s"),
-        "D6": (drawing_name or "", "s"),
-        "I6": ("шт", "s"),
-        "J6": (1, "n"),
+        "C6": ("Металлоконструкции", "s", None),
+        "D6": (drawing_name or "", "s", None),
+        "I6": ("шт", "s", None),
+        "J6": (1, "n", None),
     }
-    agg, display, order, notes = {}, {}, [], []
+    agg, info, order, notes, dopisat = {}, {}, [], [], []
+    summary = {"yellow": 0, "orange": 0, "red": 0}
+
     for p in positions:
         raw = match_sortament(p.get("sortament") or p.get("name") or "")
         if not raw:
@@ -441,42 +540,100 @@ def build_raschet_cells(positions, drawing_name, svod_index=None):
         if mass <= 0:
             continue
         grade = str(p.get("grade") or "")
-        # подбор имени из «Сводной» (точное или ближайший аналог)
-        if svod_index:
+        uncertain = bool(p.get("uncertain"))
+        typ = _parse_profile(raw)[0]
+        dim0 = (_parse_profile(raw)[1] or [None])[0]
+
+        name, mark, comment = raw, None, ""
+        if uncertain:
+            name, mark = raw, "red"
+            comment = "ВНИМАНИЕ: неуверенно прочитано с чертежа. Проверить вручную."
+        elif svod_index:
             resolved, how = resolve_to_svodnaya(raw, grade, svod_index)
+            if how == "точно":
+                name, mark = resolved, None
+            elif how == "аналог":
+                if typ == "ЛИСТ":
+                    name, mark = resolved, "yellow"
+                    comment = f"Лист заменён на ближайший: {resolved}."
+                else:
+                    real = make_real_name(dim0, resolved, typ) if dim0 else raw
+                    name, mark = real, "orange"
+                    price = price_map.get(resolved)
+                    dopisat.append((real, price))
+                    comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
+            else:  # не нашли совсем
+                name, mark = raw, "red"
+                comment = "Не найдено в базе. Проверить и добавить цену."
         else:
-            resolved, how = raw, "нет-индекса"
-        if how in ("аналог", "нет"):
-            notes.append({"исходное": raw, "подставлено": resolved, "тип": how})
-        key = _norm_key(resolved)
+            name, mark = raw, None
+
+        key = _norm_key(name)
         if key not in agg:
             agg[key] = 0.0
-            display[key] = resolved
+            info[key] = (name, mark, comment)
             order.append(key)
         agg[key] = max(agg[key], mass)
+        if mark in ("аналог",):
+            pass
+        if mark:
+            notes.append({"исходное": raw, "имя": name, "пометка": mark, "коммент": comment})
+
     total = 0.0
     for i, key in enumerate(order):
         if i >= len(STEEL_COLUMNS):
             break
         c = STEEL_COLUMNS[i]
-        cells[f"{c}5"] = (display[key], "s")
-        cells[f"{c}6"] = (round(agg[key], 2), "n")
+        name, mark, comment = info[key]
+        cells[f"{c}5"] = (name, "s", mark)             # имя (с цветом)
+        cells[f"{c}6"] = (round(agg[key], 2), "n", None)  # масса
+        if comment:
+            cells[f"{c}7"] = (comment, "s", None)      # комментарий в соседней (нижней) ячейке
+        if mark in summary:
+            summary[mark] += 1
         total += agg[key]
-    cells["K6"] = (round(total, 2), "n")
-    return cells, notes
+    cells["K6"] = (round(total, 2), "n", None)
+    return cells, notes, dopisat, summary
 
 
 def fill_template(xlsx_bytes, positions, drawing_name):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
-    svod_index = build_svodnaya_index(read_svodnaya_names(xlsx_bytes))
+    entries, free_rows = read_svodnaya_full(xlsx_bytes)
+    price_map = {nm: pr for _, nm, pr in entries}
+    svod_index = build_svodnaya_index([nm for _, nm, _ in entries])
+    cells, notes, dopisat, summary = build_raschet_cells(positions, drawing_name, svod_index, price_map)
 
-    s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")  # Расчет
-    cells, notes = build_raschet_cells(positions, drawing_name, svod_index)
-    for ref, (val, kind) in cells.items():
-        s1 = set_cell(s1, ref, val, kind)
+    # стили цветов (создаём только нужные)
+    styles = parts["xl/styles.xml"].decode("utf-8")
+    used = {m for _, _, m in cells.values() if m}
+    style_idx = {}
+    if "red" in used:
+        styles, red_fill = _ensure_red_fill(styles)
+    for mark in used:
+        fill = {"yellow": 2, "orange": 6}.get(mark)
+        if mark == "red":
+            fill = red_fill
+        styles, idx = add_marker_style(styles, fill)
+        style_idx[mark] = idx
+    parts["xl/styles.xml"] = styles.encode("utf-8")
+
+    # лист «Расчет»
+    s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")
+    for ref, (val, kind, mark) in cells.items():
+        sid = style_idx.get(mark) if mark else None
+        s1 = set_cell(s1, ref, val, kind, sid)
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
+
+    # дозапись оранжевых в «Сводную» (реальное имя + цена аналога) в свободные строки
+    if dopisat and free_rows:
+        s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
+        for (real_name, price), row in zip(dopisat, list(free_rows)):
+            s6 = set_cell(s6, f"C{row}", real_name, "s")
+            if price is not None:
+                s6 = set_cell(s6, f"G{row}", price, "n")
+        parts["xl/worksheets/sheet6.xml"] = s6.encode("utf-8")
 
     wb = parts["xl/workbook.xml"].decode("utf-8")
     parts["xl/workbook.xml"] = ensure_full_calc(wb).encode("utf-8")
@@ -486,7 +643,7 @@ def fill_template(xlsx_bytes, positions, drawing_name):
     for zi in zin.infolist():
         zout.writestr(zi, parts[zi.filename])
     zout.close()
-    return out.getvalue(), notes
+    return out.getvalue(), notes, summary
 
 
 # ---------------------------------------------------------------------------
@@ -551,14 +708,27 @@ def process_order(order_id):
 
         phase("FILL_EXCEL")
         drawing_name = data.get("drawing") or order.get(DRAWING_PATH_COL, "")
-        filled, notes = fill_template(tpl, positions, drawing_name)
+        filled, notes, summary = fill_template(tpl, positions, drawing_name)
         if notes:
             phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
+        review_total = summary["yellow"] + summary["orange"] + summary["red"]
+        phase("REVIEW_SUMMARY", **summary, total=review_total)
 
         phase("SAVE", bytes=len(filled))
         path = f"{order_id}.xlsx"
         upload_result(path, filled)
-        db_update(order_id, {RESULT_PATH_COL: path, STATUS_COL: STATUS_DONE})
+        result_fields = {RESULT_PATH_COL: path, STATUS_COL: STATUS_DONE}
+        # сводка на проверку для дашборда (поля могут отсутствовать в схеме — пишем мягко)
+        try:
+            db_update(order_id, {
+                **result_fields,
+                "review_total": review_total,
+                "review_yellow": summary["yellow"],
+                "review_orange": summary["orange"],
+                "review_red": summary["red"],
+            })
+        except Exception:
+            db_update(order_id, result_fields)  # если полей нет в схеме — хотя бы статус
 
         phase("DONE", ms=int((time.time() - t0) * 1000),
               needs_review=needs_review, mass_check=check)
