@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v7-comment-row1-2026-06-10"
+WORKER_VERSION = "v8-prices-angles-2026-06-10"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
