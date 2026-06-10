@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v6-colors-dopisat-2026-06-09"
+WORKER_VERSION = "v7-comment-row1-2026-06-10"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -588,7 +588,7 @@ def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None
         cells[f"{c}5"] = (name, "s", mark)             # имя (с цветом)
         cells[f"{c}6"] = (round(agg[key], 2), "n", None)  # масса
         if comment:
-            cells[f"{c}7"] = (comment, "s", None)      # комментарий в соседней (нижней) ячейке
+            cells[f"{c}1"] = (comment, "s", None)      # комментарий сверху, над названием
         if mark in summary:
             summary[mark] += 1
         total += agg[key]
