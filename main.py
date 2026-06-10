@@ -597,6 +597,7 @@ def resolve_to_svodnaya(name, grade, index):
         if same_leg:
             return max(same_leg, key=lambda x: x[0][1][1])[1], "аналог"
     else:
+        big = sorted([(pp[1][0], pp, nm) for pp, nm in cands if pp[1] and dims and pp[1][0] >= dims[0] and same_sub(pp)], key=lambda x: x[0])
         big = gpref([(pp, nm) for _, pp, nm in big])
         if big:
             return big[0][1], "аналог"
