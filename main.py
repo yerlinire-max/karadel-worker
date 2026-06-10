@@ -476,13 +476,16 @@ def _parse_profile(name):
         return ("ШВЕЛЛЕР", nums(s.split(",")[0].replace("швеллер", ""))[:1], grade, None)
     if "уголок" in s:
         a = nums(s.split("уголок")[1].split(",")[0])
+        sub = None
         if len(a) >= 3:
-            dims = [max(a[:-1]), a[-1]]      # неравнополочный: бОльшая полка + толщина
+            if a[0] != a[1]:
+                sub = "неравн"            # неравнополочный
+            dims = [max(a[:-1]), a[-1]]   # бОльшая полка + толщина
         elif len(a) == 2:
             dims = [a[0], a[1]]
         else:
             dims = a[:1]
-        return ("УГОЛОК", dims, grade, None)
+        return ("УГОЛОК", dims, grade, sub)
     if "лист" in s:
         body = s.split("лист")[1].split(",")[0].replace("ст 3", "").replace("t", "")
         return ("ЛИСТ", nums(body)[:1], grade, None)
@@ -538,6 +541,8 @@ def resolve_to_svodnaya(name, grade, index):
     """Возвращает (имя_из_Сводной, способ). способ: 'точно' | 'аналог' | 'нет'."""
     p = _parse_profile(name)
     typ, dims, _, sub = p
+    if typ == "УГОЛОК" and "гнут" in name.lower():
+        return name, "гнутый"
     cands = index.get(typ, [])
     if not cands:
         return name, "нет"
@@ -586,16 +591,14 @@ def resolve_to_svodnaya(name, grade, index):
         leg, th = dims[0], dims[1]
         legs = sorted({pp[1][0] for pp, nm in cands if pp[1]})
         bigger = [L for L in legs if L >= leg]
-        std_leg = bigger[0] if bigger else (legs[-1] if legs else leg)
-        same_leg = gpref([(pp, nm) for pp, nm in cands if pp[1] and pp[1][0] == std_leg])
-        ex = [(pp, nm) for pp, nm in same_leg if len(pp[1]) >= 2 and pp[1][1] == th]
-        ge = sorted([(pp[1][1], nm) for pp, nm in same_leg if len(pp[1]) >= 2 and pp[1][1] >= th])
-        if ex:
-            return ex[0][1], "аналог"
-        if ge:
-            return ge[0][1], "аналог"
-        if same_leg:
-            return max(same_leg, key=lambda x: x[0][1][1])[1], "аналог"
+        if bigger:
+            std_leg = bigger[0]
+            same = gpref([(pp, nm) for pp, nm in cands
+                          if pp[1] and pp[1][0] == std_leg and len(pp[1]) >= 2 and pp[1][1] == th])
+            if same:
+                return same[0][1], "аналог"
+        # нет стандартного с такой толщиной на ближайшей полке -> гнутый
+        return name, "гнутый"
     else:
         big = sorted([(pp[1][0], pp, nm) for pp, nm in cands if pp[1] and dims and pp[1][0] >= dims[0] and same_sub(pp)], key=lambda x: x[0])
         big = gpref([(pp, nm) for _, pp, nm in big])
@@ -657,33 +660,41 @@ def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None
             resolved, how = resolve_to_svodnaya(raw, grade, svod_index)
             if how == "точно":
                 name, mark = resolved, None
+                if typ == "УГОЛОК" and _parse_profile(raw)[3] == "неравн":
+                    mark = "yellow"
+                    comment = f"Неравнополочный уголок сведён к равнополочному {resolved}. Проверить."
+            elif how == "гнутый":
+                # гнутый уголок: стандартного с такой толщиной нет — оставляем
+                # реальную геометрию, помечаем красным, цену ставит менеджер
+                a = [x.replace(",", ".") for x in re.findall(r"\d+(?:[.,]\d+)?", raw)]
+                def _f(v):
+                    return str(int(float(v))) if float(v).is_integer() else v
+                body = "*".join(_f(x) for x in a) if a else ""
+                real = f"Уголок {body}".strip()
+                if "гнут" not in real.lower():
+                    real += " гнутый"
+                name, mark = real, "red"
+                comment = "Гнутый уголок (нет стандартного с такой толщиной полки). Запросить цену у менеджера."
             elif how == "аналог":
                 if typ == "ЛИСТ":
                     name, mark = resolved, "yellow"
                     comment = f"Лист заменён на ближайший: {resolved}."
+                elif typ in ("ТРУБА_ПРОФ", "ТРУБА_КРУГ"):
+                    name, mark = raw, "orange"
+                    price = price_map.get(resolved)
+                    dopisat.append((raw, price))
+                    comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
+                elif typ == "УГОЛОК":
+                    # полка округлена до ближайшей стандартной; resolved РЕАЛЬНО есть
+                    # в «Сводной» со своей ценой -> жёлтый, дозапись не нужна
+                    name, mark = resolved, "yellow"
+                    comment = f"Уголок заменён на ближайший стандартный: {resolved}. Цена от него."
                 else:
-                    # для труб имя берём как прочитано (там реальный размер,
-                    # в т.ч. прямоугольный 160x120x4); make_real_name их «квадратит»
-                    if typ in ("ТРУБА_ПРОФ", "ТРУБА_КРУГ"):
-                        real = raw
-                        comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
-                    elif typ == "УГОЛОК":
-                        # имя = полка из аналога (округлена до стандартной) + РЕАЛЬНАЯ толщина
-                        dd = _parse_profile(raw)[1] or []
-                        th = dd[1] if len(dd) >= 2 else None
-                        if th is not None:
-                            tt = int(th) if float(th).is_integer() else th
-                            real = re.sub(r"(\d+)\s*\*\s*\d+",
-                                          lambda m: f"{m.group(1)}*{tt}", resolved, count=1)
-                        else:
-                            real = resolved
-                        comment = f"Замена: {raw} → {real} (цена от {resolved}). Проверить цену."
-                    else:
-                        real = make_real_name(dim0, resolved, typ) if dim0 else raw
-                        comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
+                    real = make_real_name(dim0, resolved, typ) if dim0 else raw
                     name, mark = real, "orange"
                     price = price_map.get(resolved)
                     dopisat.append((real, price))
+                    comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
             else:  # не нашли совсем
                 name, mark = raw, "red"
                 comment = "Не найдено в базе. Проверить и добавить цену."
