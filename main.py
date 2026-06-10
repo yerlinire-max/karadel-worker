@@ -123,14 +123,18 @@ EXTRACTION_PROMPT = """
 - «Швеллеры …», «Швеллер», «[N»            → "Швеллер <номер>"  (напр. [10 → "Швеллер 10")
 - «Прокат листовой …», «Лист», «t<N>»       → "Лист t<толщина>"  (t10 → "Лист t10")
 - «Прокат угловой равнополочный …», «Уголок», «L…» → "Уголок <размер>" (L100x10 → "Уголок 100x10")
-- «Квадратные трубы …», «Профильная труба», «Труба проф.», «[]…», размер вида
-  СТОРОНАxСТОРОНАxТОЛЩИНА (100x100x4) или []100x5 → "Труба проф. <размер>"
-  ([]100x5 → "Труба проф. 100x5", 60x40x3 → "Труба проф. 60x40x3")
-- КРУГЛАЯ труба (электросварные ГОСТ 10704/10705, бесшовные ГОСТ 8732/8734,
-  ВГП, в названии «электросварные»/«бесшовные»/«Ф»/«Ø»/«круглая», размер вида
-  ДИАМЕТРxТОЛЩИНА с ОДНИМ диаметром, напр. 273x4, Ф159х4) → "Труба <диаметр>x<толщина>"
-  (273x4 → "Труба 273x4"). НЕ пиши такие как «Труба проф.».
-  Различай по ЛЕВОМУ столбцу/ГОСТу: 10704 и 8732 — это КРУГЛАЯ труба, а не профильная.
+- ТРУБЫ. Круглая или профильная — определяй ТОЛЬКО по ЛЕВОМУ столбцу (вид
+  профиля/ГОСТ), а НЕ по количеству чисел в размере. Это критично: и круглая,
+  и квадратная труба могут писаться двумя числами (273x4 и 250x6 выглядят
+  одинаково, но это РАЗНЫЕ трубы).
+  • КВАДРАТНАЯ / ПРЯМОУГОЛЬНАЯ (профильная): левый столбец «Трубы квадратные…»,
+    «Трубы прямоугольные…», ГОСТ 30245 / 8639 / 8645, слова «профильная»/«[]…».
+    → "Труба проф. <размер>". Квадратная может быть записана как «250x6»
+    (это 250×250×6) или «250×250×6»; прямоугольная — тремя числами «160×120×4».
+  • КРУГЛАЯ: левый столбец «электросварные»/«бесшовные»/«водогазопроводные/ВГП»,
+    ГОСТ 10704 / 10705 / 8732 / 8734 / 3262, символы «Ф»/«Ø», размер диаметр×толщина
+    (273x4, Ф159х4). → "Труба <диаметр>x<толщина>" (273x4 → "Труба 273x4").
+    НЕ пиши такие как «Труба проф.».
 - «Двутавр …», «Балка», «<N>К<n>», «<N>Б<n>»→ "Балка <обозначение>" (30К1 → "Балка 30К1", 30Б1 → "Балка 30Б1")
 ВАЖНО: обозначения вида «30К1», «23К1», «30Б1» — это ДВУТАВРЫ (балки),
 а НЕ листы. Никогда не пиши их как «Лист».
@@ -493,7 +497,14 @@ def _parse_profile(name):
         body = re.sub(r"(\d),(\d)", r"\1.\2", s).split(",")[0]  # отрезать ", 12м"
         n = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", body)]
         if is_prof:
-            return ("ТРУБА_ПРОФ", ([n[0], n[-1]] if len(n) >= 2 else n), grade, None)
+            if len(n) >= 3:
+                sides = sorted(n[:-1], reverse=True)[:2]
+                dims = [sides[0], sides[1], n[-1]]   # [большая сторона, меньшая, толщина]
+            elif len(n) == 2:
+                dims = [n[0], n[0], n[1]]            # квадрат «250x6» = 250×250×6
+            else:
+                dims = n
+            return ("ТРУБА_ПРОФ", dims, grade, None)
         return ("ТРУБА_КРУГ", n, grade, None)
     return ("?", [], grade, None)
 
@@ -506,6 +517,16 @@ def build_svodnaya_index(names):
     return index
 
 
+def _grade_class(g):
+    """Класс марки для выбора варианта в «Сводной»: '09Г2С' (низколегир.) | 'ст3' (углерод.) | None."""
+    g = (g or "").upper().replace(" ", "")
+    if any(k in g for k in ("09Г2С", "10ХСНД", "С345", "С375", "С390", "С440")):
+        return "09Г2С"
+    if any(k in g for k in ("С235", "С245", "С255", "С285", "СТ3", "ВСТ3")):
+        return "ст3"
+    return None
+
+
 def resolve_to_svodnaya(name, grade, index):
     """Возвращает (имя_из_Сводной, способ). способ: 'точно' | 'аналог' | 'нет'."""
     p = _parse_profile(name)
@@ -513,7 +534,13 @@ def resolve_to_svodnaya(name, grade, index):
     cands = index.get(typ, [])
     if not cands:
         return name, "нет"
-    want = "09Г2С" if typ == "ЛИСТ" else ("09Г2С" if grade == "С345" and typ == "УГОЛОК" else None)
+    gcls = _grade_class(grade)
+    if typ == "ЛИСТ":
+        want = gcls                       # марка листа берётся с чертежа: С245→ст3, С345→09Г2С
+    elif typ == "УГОЛОК" and gcls == "09Г2С":
+        want = "09Г2С"
+    else:
+        want = None
 
     def gpref(lst):
         if want:
@@ -531,14 +558,23 @@ def resolve_to_svodnaya(name, grade, index):
         return gpref(exact)[0][1], "точно"
 
     # ближайший больший
-    if typ == "ТРУБА_ПРОФ" and len(dims) >= 2:
-        side, wall = dims
-        sw = [(pp[1][0], nm) for pp, nm in cands if len(pp[1]) >= 2 and pp[1][1] == wall and pp[1][0] >= side]
-        if sw:
-            return min(sw)[1], "аналог"
-        any_ = [(pp[1][0], nm) for pp, nm in cands if pp[1] and pp[1][0] >= side]
-        if any_:
-            return min(any_)[1], "аналог"
+    if typ == "ТРУБА_ПРОФ" and len(dims) >= 3:
+        big, small, wall = dims[0], dims[1], dims[2]
+        # 1) то же сечение (обе стороны), толщина >= нужной — ближайшая большая толщина
+        same_sec = [(pp[1][2], nm) for pp, nm in cands
+                    if len(pp[1]) >= 3 and pp[1][0] == big and pp[1][1] == small and pp[1][2] >= wall]
+        if same_sec:
+            return min(same_sec)[1], "аналог"
+        # 2) обе стороны >= нужных и толщина >= нужной — ближайший по площади сечения
+        bigger = [(pp[1][0] * pp[1][1], nm) for pp, nm in cands
+                  if len(pp[1]) >= 3 and pp[1][0] >= big and pp[1][1] >= small and pp[1][2] >= wall]
+        if bigger:
+            return min(bigger)[1], "аналог"
+        # 3) обе стороны >= нужных, толщина любая
+        bigger2 = [(pp[1][0] * pp[1][1], nm) for pp, nm in cands
+                   if len(pp[1]) >= 3 and pp[1][0] >= big and pp[1][1] >= small]
+        if bigger2:
+            return min(bigger2)[1], "аналог"
     else:
         big = sorted([(pp[1][0], pp, nm) for pp, nm in cands if pp[1] and dims and pp[1][0] >= dims[0] and same_sub(pp)], key=lambda x: x[0])
         big = gpref([(pp, nm) for _, pp, nm in big])
@@ -605,7 +641,12 @@ def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None
                     name, mark = resolved, "yellow"
                     comment = f"Лист заменён на ближайший: {resolved}."
                 else:
-                    real = make_real_name(dim0, resolved, typ) if dim0 else raw
+                    # для труб имя берём как прочитано (там реальный размер,
+                    # в т.ч. прямоугольный 160x120x4); make_real_name их «квадратит»
+                    if typ in ("ТРУБА_ПРОФ", "ТРУБА_КРУГ"):
+                        real = raw
+                    else:
+                        real = make_real_name(dim0, resolved, typ) if dim0 else raw
                     name, mark = real, "orange"
                     price = price_map.get(resolved)
                     dopisat.append((real, price))
