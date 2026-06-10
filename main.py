@@ -475,7 +475,14 @@ def _parse_profile(name):
     if "швеллер" in s:
         return ("ШВЕЛЛЕР", nums(s.split(",")[0].replace("швеллер", ""))[:1], grade, None)
     if "уголок" in s:
-        return ("УГОЛОК", nums(s.split("уголок")[1].split(",")[0])[:2], grade, None)
+        a = nums(s.split("уголок")[1].split(",")[0])
+        if len(a) >= 3:
+            dims = [max(a[:-1]), a[-1]]      # неравнополочный: бОльшая полка + толщина
+        elif len(a) == 2:
+            dims = [a[0], a[1]]
+        else:
+            dims = a[:1]
+        return ("УГОЛОК", dims, grade, None)
     if "лист" in s:
         body = s.split("лист")[1].split(",")[0].replace("ст 3", "").replace("t", "")
         return ("ЛИСТ", nums(body)[:1], grade, None)
@@ -575,8 +582,21 @@ def resolve_to_svodnaya(name, grade, index):
                    if len(pp[1]) >= 3 and pp[1][0] >= big and pp[1][1] >= small]
         if bigger2:
             return min(bigger2)[1], "аналог"
+    elif typ == "УГОЛОК" and len(dims) >= 2:
+        leg, th = dims[0], dims[1]
+        legs = sorted({pp[1][0] for pp, nm in cands if pp[1]})
+        bigger = [L for L in legs if L >= leg]
+        std_leg = bigger[0] if bigger else (legs[-1] if legs else leg)
+        same_leg = gpref([(pp, nm) for pp, nm in cands if pp[1] and pp[1][0] == std_leg])
+        ex = [(pp, nm) for pp, nm in same_leg if len(pp[1]) >= 2 and pp[1][1] == th]
+        ge = sorted([(pp[1][1], nm) for pp, nm in same_leg if len(pp[1]) >= 2 and pp[1][1] >= th])
+        if ex:
+            return ex[0][1], "аналог"
+        if ge:
+            return ge[0][1], "аналог"
+        if same_leg:
+            return max(same_leg, key=lambda x: x[0][1][1])[1], "аналог"
     else:
-        big = sorted([(pp[1][0], pp, nm) for pp, nm in cands if pp[1] and dims and pp[1][0] >= dims[0] and same_sub(pp)], key=lambda x: x[0])
         big = gpref([(pp, nm) for _, pp, nm in big])
         if big:
             return big[0][1], "аналог"
@@ -645,12 +665,24 @@ def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None
                     # в т.ч. прямоугольный 160x120x4); make_real_name их «квадратит»
                     if typ in ("ТРУБА_ПРОФ", "ТРУБА_КРУГ"):
                         real = raw
+                        comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
+                    elif typ == "УГОЛОК":
+                        # имя = полка из аналога (округлена до стандартной) + РЕАЛЬНАЯ толщина
+                        dd = _parse_profile(raw)[1] or []
+                        th = dd[1] if len(dd) >= 2 else None
+                        if th is not None:
+                            tt = int(th) if float(th).is_integer() else th
+                            real = re.sub(r"(\d+)\s*\*\s*\d+",
+                                          lambda m: f"{m.group(1)}*{tt}", resolved, count=1)
+                        else:
+                            real = resolved
+                        comment = f"Замена: {raw} → {real} (цена от {resolved}). Проверить цену."
                     else:
                         real = make_real_name(dim0, resolved, typ) if dim0 else raw
+                        comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
                     name, mark = real, "orange"
                     price = price_map.get(resolved)
                     dopisat.append((real, price))
-                    comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
             else:  # не нашли совсем
                 name, mark = raw, "red"
                 comment = "Не найдено в базе. Проверить и добавить цену."
@@ -694,25 +726,39 @@ def fill_template(xlsx_bytes, positions, drawing_name):
     svod_index = build_svodnaya_index([nm for _, nm, _ in entries])
     cells, notes, dopisat, summary = build_raschet_cells(positions, drawing_name, svod_index, price_map)
 
-    # стили цветов (создаём только нужные)
+    # стили цветов: для каждой помечаемой ячейки клонируем ЕЁ СОБСТВЕННЫЙ стиль
+    # (шрифт, перенос, рамка) и только меняем заливку — формат ячейки сохраняется
     styles = parts["xl/styles.xml"].decode("utf-8")
+    s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")
+
     used = {m for _, _, m in cells.values() if m}
-    style_idx = {}
+    fill_for = {}
     if "red" in used:
         styles, red_fill = _ensure_red_fill(styles)
     for mark in used:
-        fill = {"yellow": 2, "orange": 6}.get(mark)
-        if mark == "red":
-            fill = red_fill
-        styles, idx = add_marker_style(styles, fill)
-        style_idx[mark] = idx
-    parts["xl/styles.xml"] = styles.encode("utf-8")
+        fill_for[mark] = red_fill if mark == "red" else {"yellow": 2, "orange": 6}[mark]
+
+    def cur_style(ref):
+        mm = re.search(r'<c r="' + ref + r'"([^>]*?)(?:/>|>)', s1)
+        if mm:
+            sm = re.search(r'\bs="(\d+)"', mm.group(1))
+            if sm:
+                return int(sm.group(1))
+        return 0
 
     # лист «Расчет»
-    s1 = parts["xl/worksheets/sheet1.xml"].decode("utf-8")
+    marker_cache = {}   # (исходный стиль ячейки, заливка) -> индекс нового стиля
     for ref, (val, kind, mark) in cells.items():
-        sid = style_idx.get(mark) if mark else None
+        sid = None
+        if mark:
+            ckey = (cur_style(ref), fill_for[mark])
+            if ckey not in marker_cache:
+                styles, idx = add_marker_style(styles, ckey[1], base_index=ckey[0])
+                marker_cache[ckey] = idx
+            sid = marker_cache[ckey]
         s1 = set_cell(s1, ref, val, kind, sid)
+
+    parts["xl/styles.xml"] = styles.encode("utf-8")
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
 
     # дозапись оранжевых в «Сводную» (реальное имя + цена аналога) в свободные строки
