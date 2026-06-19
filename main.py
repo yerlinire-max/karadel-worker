@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v10d-krug-type-2026-06-19"
+WORKER_VERSION = "v10e-weld-check-2026-06-19"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -131,6 +131,10 @@ EXTRACTION_PROMPT = """
    ВАЖНО про задвоение: КАЖДУЮ строку-позицию спецификации учитывай РОВНО ОДИН раз.
    Суммируй массы из столбца «общ.» по сортаменту, но не прибавляй одну и ту же
    позицию дважды и не добавляй строки-подытоги/«Всего»/«Масса элемента».
+   ВАЖНО про полноту: НЕ ПРОПУСКАЙ НИ ОДНОЙ строки спецификации, даже мелкие детали
+   (масса 0,1–0,6 кг). Позиции пронумерованы подряд (1,2,3,…N) — пройди ВСЕ номера
+   по порядку и убедись, что ни один номер не пропущен. Особенно внимательно к
+   последним строкам таблицы и к строкам с количеством >1 (напр. «4 шт»).
 4) СВАРКА: металл считаем БЕЗ массы сварных швов. НЕ добавляй позицию «Сварка»
    в positions и НЕ включай массу швов в металл. Если в спецификации есть строка
    «На сварку N%» — просто верни число в поле weld_pct=N (справочно), но НЕ
@@ -1228,13 +1232,30 @@ def process_order(order_id):
         except (TypeError, ValueError):
             control = None
 
-        check = {"sum_mass_kg": sum_mass, "control_total_kg": control}
-        if control and control > 0:
-            diff_pct = round(abs(sum_mass - control) / control * 100, 1)
+        # Сварка: металл считаем БЕЗ швов. Если контрольная масса дана СО сваркой,
+        # вычитаем % сварки, чтобы сравнивать сопоставимое и не искать «потерянные»
+        # детали там, где разница — это сварные швы.
+        try:
+            weld_pct = float(data.get("weld_pct")) if data.get("weld_pct") is not None else None
+        except (TypeError, ValueError):
+            weld_pct = None
+        control_noweld = control
+        if control and weld_pct:
+            # масса_элемента = детали + детали*weld%  =>  детали = масса / (1 + weld/100)
+            control_noweld = round(control / (1.0 + weld_pct / 100.0), 2)
+
+        check = {"sum_mass_kg": sum_mass, "control_total_kg": control,
+                 "weld_pct": weld_pct, "control_no_weld_kg": control_noweld}
+        if control_noweld and control_noweld > 0:
+            diff_pct = round(abs(sum_mass - control_noweld) / control_noweld * 100, 1)
             check["diff_pct"] = diff_pct
-            # допуск 1% — масса в спецификации дана с учётом отходов/швов
+            # допуск 1% — масса в спецификации дана с учётом отходов
             check["ok"] = diff_pct <= 1.0
             check_status = "CHECK_OK" if check["ok"] else "CHECK_MISMATCH"
+            if not check["ok"]:
+                check["note"] = (f"сумма деталей {sum_mass} кг отличается от контрольной "
+                                 f"{control_noweld} кг (без сварки) на {diff_pct}% — "
+                                 f"проверьте, не пропущена ли позиция спецификации")
         else:
             check["ok"] = None
             check["note"] = "контрольный итог не найден — проверьте вручную"
