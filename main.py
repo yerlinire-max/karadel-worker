@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v8f-canon-tube-2026-06-10"
+WORKER_VERSION = "v9-metall-pricelist-2026-06-19"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -70,6 +70,9 @@ ERROR_MSG_COL = "error_message"     # сюда пишем текст ошибк�
 DRAWINGS_BUCKET = "drawings"
 TEMPLATES_BUCKET = "templates"
 RESULTS_BUCKET = "results"
+PRICELIST_BUCKET = "pricelists"     # сюда оболочка кладёт прайс металлобазы «металл»
+# имя файла прайса «металл» в бакете PRICELIST_BUCKET (можно переопределить env-переменной)
+PRICELIST_PATH = os.environ.get("PRICELIST_PATH", "metall.xlsx")
 
 # путь активного шаблона в бакете TEMPLATES_BUCKET (задаётся env-переменной)
 TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "")
@@ -273,6 +276,44 @@ def get_template_bytes():
     if not TEMPLATE_PATH:
         raise RuntimeError("TEMPLATE_PATH не задан (путь активного шаблона в бакете templates)")
     return sb.storage.from_(TEMPLATES_BUCKET).download(TEMPLATE_PATH)
+
+
+def load_metall_pricelist():
+    """Читает загруженный прайс металлобазы «металл» из бакета PRICELIST_BUCKET.
+    Возвращает {имя_материала: цена_за_тонну}. Имя — колонка B (с 16-й строки),
+    цена — колонка H («Цена за 1 тн»). Цены здесь УЖЕ за тонну (как в «Сводной»).
+    Если файла нет или нет openpyxl — возвращает пусто, расчёт продолжается."""
+    out = {}
+    try:
+        data = sb.storage.from_(PRICELIST_BUCKET).download(PRICELIST_PATH)
+    except Exception as e:
+        log.info("[pricelist] прайс «металл» не загружен (%s) — пропускаю", e)
+        return out
+    try:
+        import openpyxl
+    except Exception:
+        log.error("[pricelist] нет openpyxl — добавьте 'openpyxl' в requirements.txt")
+        return out
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+        ws = wb["металл"] if "металл" in wb.sheetnames else wb[wb.sheetnames[0]]
+        for row in ws.iter_rows(min_row=16, values_only=True):
+            if len(row) < 8:
+                continue
+            name = row[1]   # B
+            price = row[7]  # H
+            if name is None:
+                continue
+            name = str(name).strip()
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                continue
+            if name and price > 0:
+                out[name] = price
+    except Exception as e:
+        log.error("[pricelist] ошибка чтения прайса: %s", e)
+    return out
 
 
 def download_drawing(order):
@@ -817,7 +858,7 @@ def apply_catalog_to_template(xlsx_bytes, catalog):
         return xlsx_bytes
 
 
-def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None):
+def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None, pricelist=None):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
@@ -861,9 +902,10 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
     parts["xl/styles.xml"] = styles.encode("utf-8")
     parts["xl/worksheets/sheet1.xml"] = s1.encode("utf-8")
 
-    # запись в «Сводную»: новые материалы (оранжевые) + справочник + цены заявки
+    # запись в «Сводную»: прайс металла (база) + новые материалы + справочник + цены заявки
     overrides = overrides or {}
     catalog = catalog or {}
+    pricelist = pricelist or {}
     name_to_row = {nm: r for r, nm, _ in entries}
     free_iter = iter(free_rows)
     s6 = parts["xl/worksheets/sheet6.xml"].decode("utf-8")
@@ -887,6 +929,17 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
         s6 = set_cell(s6, f"G{row}", price, "n")
         s6_changed = True
         return True
+
+    # 0) базовые цены металла из загруженного прайса (за тонну, КАК ЕСТЬ — без ×1000),
+    #    только по точному совпадению имени; перезаписываем формулу-ссылку [1]металл числом.
+    #    Чего нет в прайсе (болты, спецбалки) — не трогаем, остаётся прежнее значение.
+    pl_applied = 0
+    for nm, price_ton in pricelist.items():
+        row = name_to_row.get(nm)
+        if row is not None and price_ton is not None:
+            s6 = set_cell(s6, f"G{row}", price_ton, "n")
+            s6_changed = True
+            pl_applied += 1
 
     # 1) новые материалы (оранжевые/трубы), которых ещё нет в «Сводной»
     for real_name, price in dopisat:
@@ -961,6 +1014,13 @@ def process_order(order_id):
             catalog = {}
             phase("CATALOG_ERROR", error=str(e)[:300])
 
+        try:
+            pricelist = load_metall_pricelist()
+            phase("PRICELIST_LOADED", count=len(pricelist))
+        except Exception as e:
+            pricelist = {}
+            phase("PRICELIST_ERROR", error=str(e)[:300])
+
         phase("LOAD_DRAWING")
         draw = download_drawing(order)
 
@@ -1007,7 +1067,7 @@ def process_order(order_id):
         phase("FILL_EXCEL")
         drawing_name = data.get("drawing") or order.get(DRAWING_PATH_COL, "")
         overrides = load_overrides(order_id)
-        filled, notes, summary = fill_template(tpl, positions, drawing_name, overrides, catalog)
+        filled, notes, summary = fill_template(tpl, positions, drawing_name, overrides, catalog, pricelist)
         if notes:
             phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
         review_total = summary["yellow"] + summary["orange"] + summary["red"]
