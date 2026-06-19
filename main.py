@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v9-metall-pricelist-2026-06-19"
+WORKER_VERSION = "v10b-spec-noweld-2026-06-19"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -62,6 +62,7 @@ CATALOG_TABLE = "catalog_overrides"   # глобальные цены справ
 STATUS_COL = "status"
 LOG_COL = "processing_log"          # JSON-массив
 DRAWING_PATH_COL = "drawing_url"    # путь файла чертежа внутри бакета DRAWINGS_BUCKET
+REQUEST_PATH_COL = "request_url"    # путь файла заявки (JPG/PDF) внутри бакета REQUESTS_BUCKET
 RESULT_PATH_COL = "result_url"      # сюда запишем путь готового файла
 STATUS_DONE = "completed"           # статус при успехе (у вас "completed", не "done")
 ERROR_MSG_COL = "error_message"     # сюда пишем текст ошибки
@@ -71,6 +72,7 @@ DRAWINGS_BUCKET = "drawings"
 TEMPLATES_BUCKET = "templates"
 RESULTS_BUCKET = "results"
 PRICELIST_BUCKET = "pricelists"     # сюда оболочка кладёт прайс металлобазы «металл»
+REQUESTS_BUCKET = "requests"        # сюда оболочка кладёт файл заявки (JPG/PDF)
 # имя файла прайса «металл» в бакете PRICELIST_BUCKET (можно переопределить env-переменной)
 PRICELIST_PATH = os.environ.get("PRICELIST_PATH", "metall.xlsx")
 
@@ -84,6 +86,52 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # Главное требование — Claude должен вернуть ТОЛЬКО JSON указанного вида.
 EXTRACTION_PROMPT = """
 Ты — инженер-расчётчик металлоконструкций. На изображениях — листы чертежа КМ.
+
+СНАЧАЛА ОПРЕДЕЛИ ТИП ТАБЛИЦЫ НА ЧЕРТЕЖЕ (это критично):
+
+ТИП 1 — «Техническая спецификация металла» (сводная по проекту/марке КМ):
+  левый столбец — ТИП профиля (Швеллеры, Прокат листовой, Прокат угловой,
+  Квадратные трубы, Двутавр…), есть столбцы масс по элементам конструкций и
+  «Общая масса», внизу «Итого масса металла». Применяй РАЗДЕЛ «ТИП 1» ниже.
+
+ТИП 2 — «Спецификация на отправочный элемент» (деталировка одного изделия,
+  напр. «Траверса Б2»): столбцы «Марка/Поз.», «Кол-во шт», «Сечение», «Длина мм»,
+  «Масса кг» с подстолбцами (т/н/шт/«элем.»/«общ.»), «Марка стали».
+  Здесь ОДИН сортамент встречается в НЕСКОЛЬКИХ позициях разной длины.
+  Применяй РАЗДЕЛ «ТИП 2» ниже.
+
+Если есть обе — бери ту, что подробнее описывает изделие на этих листах.
+
+============================ РАЗДЕЛ «ТИП 2» ============================
+(деталировочная спецификация отправочного элемента)
+
+ЦЕЛЬ: получить суммарную массу КАЖДОГО сортамента по всему изделию.
+
+ПРАВИЛА ТИП 2:
+1) ГРУППИРУЙ позиции по сортаменту и СУММИРУЙ их массы. Один и тот же профиль
+   (напр. уголок 63×5) встречается в позициях 2,3,4,5,6 — их массы СКЛАДЫВАЙ
+   в одну позицию sortament="Уголок 63x5".
+2) МАССУ бери из столбца «общ.» (общая масса позиции — там уже учтено
+   «Кол-во шт» деталей). НЕ из «элем.» (это масса одной детали).
+3) НАЗВАНИЯ сортамента (как в «Сводной»):
+   - уголок «{70х6», «∟70×6», «L70x6» → "Уголок 70x6"
+   - ЛИСТ/ПОЛОСА «−16×100», «-16x100» (первое число — ТОЛЩИНА, второе — ширина):
+     бери ТОЛЬКО толщину → "Лист 16". Ширину и длину НЕ используй для названия.
+   - КРУГ/арматура «⌀20», «Ø20», «q20», «d20» → "Круг 20" (НЕ труба!).
+   - труба только если явно написано «труба».
+4) СВАРКА: металл считаем БЕЗ массы сварных швов. НЕ добавляй позицию «Сварка»
+   в positions и НЕ включай массу швов в металл. Если в спецификации есть строка
+   «На сварку N%» — просто верни число в поле weld_pct=N (справочно), но НЕ
+   прибавляй её к массе. weld_pct нужен только для информации, не для расчёта.
+5) НЕ включай в positions крепёж из «Ведомости монтажных метизов»
+   (болты/гайки/шайбы) — это отдельный учёт, не металл «Сводной».
+6) control_total_kg = СУММА МАСС ДЕТАЛЕЙ БЕЗ СВАРКИ (в кг). Если в спецификации
+   итоговая «масса элемента» дана СО сваркой (напр. 108.96 = детали + сварка 1.08),
+   ВЫЧТИ массу сварки: control_total_kg = масса_элемента − масса_сварки
+   (108.96 − 1.08 = 107.88). Это число должно совпадать с суммой mass_kg позиций.
+7) "mark" — марка изделия из штампа/заголовка спецификации (напр. "Траверса Б2").
+
+============================ РАЗДЕЛ «ТИП 1» ============================
 Главный источник данных — таблица «Техническая спецификация металла»
 (обычно лист 1–2). Извлеки из неё перечень стального проката.
 
@@ -167,6 +215,8 @@ EXTRACTION_PROMPT = """
 Верни СТРОГО JSON без пояснений и markdown:
 {
   "drawing": "обозначение из штампа, если видно",
+  "mark": "марка изделия для ТИП 2 (напр. «Траверса Б2»); для ТИП 1 — null",
+  "weld_pct": null,
   "control_total_kg": 70103.84,
   "positions": [
     {"sortament": "Швеллер 10", "grade": "С255", "mass_kg": 5803.68, "qty": 1},
@@ -384,6 +434,88 @@ def extract_positions(images_b64):
     )
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
     return parse_json(text)
+
+
+REQUEST_PROMPT = """Ты разбираешь ЗАЯВКУ заказчика на металлоконструкции (фото/скан/PDF таблицы).
+Извлеки КАЖДУЮ строку таблицы заявки. Верни СТРОГО JSON без пояснений и без ```:
+{
+  "items": [
+    {"pos": "1", "mark": "ТМs-68", "name": "Траверса", "qty": 1359, "unit": "шт"},
+    ...
+  ]
+}
+Правила:
+- "mark" — артикул/обозначение/марка изделия (например «ТМs-68», «ТМ73», «Т13.16», «Б2»).
+  Бери его из колонки «Артикул»/«Обозначение» или из начала наименования. Сохраняй как написано.
+- "name" — наименование без марки (например «Траверса», «Опора скользящая»). Если нет — пусто.
+- "qty" — количество ЧИСЛОМ (убери пробелы-разделители тысяч: «1 359» -> 1359). Если нет — null.
+- "unit" — единица как в заявке (шт, компл, м, кг, т). Если нет — пусто.
+- Бери ВСЕ строки подряд, ничего не пропускай и не фильтруй (даже провод, изоляторы, зажимы).
+- Не придумывай значения. Чего не видно — оставь пустым/null.
+"""
+
+
+def extract_request_items(images_b64):
+    """Распознаёт заявку (фото/PDF) -> {"items": [{pos, mark, name, qty, unit}, ...]}."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+        for b in images_b64
+    ]
+    content.append({"type": "text", "text": REQUEST_PROMPT})
+    resp = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=8192,
+        messages=[{"role": "user", "content": content}],
+    )
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    try:
+        data = parse_json(text)
+    except Exception:
+        return {"items": []}
+    return data if isinstance(data, dict) and "items" in data else {"items": []}
+
+
+def download_request(order):
+    """Скачивает файл заявки из бакета REQUESTS_BUCKET (если он прикреплён)."""
+    path = order.get(REQUEST_PATH_COL)
+    if not path:
+        return None
+    try:
+        return sb.storage.from_(REQUESTS_BUCKET).download(path)
+    except Exception as e:
+        log.error("[request] не удалось скачать заявку: %s", e)
+        return None
+
+
+def _norm_mark(s):
+    """Нормализует марку для сравнения: убирает дефисы/пробелы/точки, регистр, ё->е.
+    «ТМ-1» = «ТМ1» = «ТМ 1»; «Т13.16» = «т1316»."""
+    s = str(s or "").lower().replace("ё", "е")
+    return re.sub(r"[\s\-_.,]+", "", s)
+
+
+def match_request_to_drawing(request_items, drawing_mark):
+    """Ищет в заявке количество для марки чертежа.
+    Возвращает (qty, status, matched_item):
+      status: "green" — точное совпадение марки; "yellow" — частичное (одна в другой);
+              "red" — не найдено (qty=None)."""
+    dn = _norm_mark(drawing_mark)
+    if not dn:
+        return None, "red", None
+    # 1) точное совпадение нормализованных марок
+    for it in request_items:
+        if _norm_mark(it.get("mark")) == dn:
+            return it.get("qty"), "green", it
+    # 2) частичное: марка чертежа входит в марку заявки или наоборот (>=3 симв.)
+    cand = []
+    for it in request_items:
+        mn = _norm_mark(it.get("mark"))
+        if len(dn) >= 3 and len(mn) >= 3 and (dn in mn or mn in dn):
+            cand.append(it)
+    if len(cand) == 1:
+        return cand[0].get("qty"), "yellow", cand[0]
+    return None, "red", None
 
 
 # ---------------------------------------------------------------------------
@@ -1032,6 +1164,33 @@ def process_order(order_id):
         data = extract_positions(images)
         positions = data.get("positions") or []
         phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=len(positions))
+
+        # --- Заявка: распознаём и подставляем количество по марке чертежа ---
+        request_items = []
+        req_data = download_request(order)
+        if req_data:
+            try:
+                req_imgs = drawing_to_images(req_data, order.get(REQUEST_PATH_COL, ""))
+                request_items = extract_request_items(req_imgs).get("items", [])
+                phase("REQUEST_PARSED", count=len(request_items))
+            except Exception as e:
+                phase("REQUEST_ERROR", error=str(e)[:300])
+
+        if request_items:
+            import os as _os
+            fname = _os.path.basename(order.get(DRAWING_PATH_COL, "") or "")
+            fname_mark = _os.path.splitext(fname)[0].replace("_", " ")
+            drawing_mark = data.get("mark") or data.get("drawing") or fname_mark
+            qty, qstatus, matched = match_request_to_drawing(request_items, drawing_mark)
+            phase("REQUEST_MATCH", drawing_mark=str(drawing_mark)[:60],
+                  qty=qty, status=qstatus,
+                  matched_mark=(matched or {}).get("mark"))
+            # подставляем количество только при надёжной (зелёной) связке;
+            # жёлтую/красную оставляем менеджеру (qty не трогаем автоматически)
+            if qstatus == "green" and qty:
+                for p in positions:
+                    p["qty_from_request"] = qty
+        # --------------------------------------------------------------------
 
         # --- Самопроверка: сумма масс vs «Итого масса металла» из таблицы ---
         sum_mass = 0.0
