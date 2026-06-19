@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v10e-weld-check-2026-06-19"
+WORKER_VERSION = "v10f-mass-fields-2026-06-19"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -1285,6 +1285,12 @@ def process_order(order_id):
                 "review_yellow": summary["yellow"],
                 "review_orange": summary["orange"],
                 "review_red": summary["red"],
+                # контроль массы (без сварки) — для показа в карточке заказа
+                "mass_sum_kg": check.get("sum_mass_kg"),
+                "mass_control_kg": check.get("control_no_weld_kg"),
+                "mass_diff_pct": check.get("diff_pct"),
+                "mass_check_status": check_status,   # CHECK_OK / CHECK_MISMATCH / CHECK_NO_CONTROL
+                "weld_pct": check.get("weld_pct"),
             })
         except Exception:
             db_update(order_id, result_fields)  # если полей нет в схеме — хотя бы статус
