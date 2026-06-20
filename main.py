@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v12-multi-drawings-2026-06-19"
+WORKER_VERSION = "v14-request-text-field-2026-06-20"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -63,6 +63,7 @@ STATUS_COL = "status"
 LOG_COL = "processing_log"          # JSON-массив
 DRAWING_PATH_COL = "drawing_url"    # путь файла чертежа внутри бакета DRAWINGS_BUCKET
 REQUEST_PATH_COL = "request_url"    # путь файла заявки (JPG/PDF) внутри бакета REQUESTS_BUCKET
+REQUEST_TEXT_COL = "request_text"   # текст заявки, вставленный менеджером прямо в форму
 RESULT_PATH_COL = "result_url"      # сюда запишем путь готового файла
 STATUS_DONE = "completed"           # статус при успехе (у вас "completed", не "done")
 ERROR_MSG_COL = "error_message"     # сюда пишем текст ошибки
@@ -524,6 +525,75 @@ REQUEST_PROMPT = """Ты разбираешь ЗАЯВКУ заказчика н
 - Бери ВСЕ строки подряд, ничего не пропускай и не фильтруй (даже провод, изоляторы, зажимы).
 - Не придумывай значения. Чего не видно — оставь пустым/null.
 """
+
+
+def _request_xlsx_to_text(data):
+    """Excel-заявка -> текст таблицы (все листы, по строкам). openpyxl уже в зависимостях."""
+    import openpyxl, io as _io
+    wb = openpyxl.load_workbook(_io.BytesIO(data), data_only=True, read_only=True)
+    lines = []
+    for ws in wb.worksheets:
+        lines.append(f"# Лист: {ws.title}")
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) for c in row if c is not None and str(c).strip()]
+            if cells:
+                lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def _request_docx_to_text(data):
+    """Word-заявка -> текст (абзацы + таблицы). docx — это zip с word/document.xml."""
+    import zipfile, io as _io
+    z = zipfile.ZipFile(_io.BytesIO(data))
+    xml = z.read("word/document.xml").decode("utf-8", "ignore")
+    # <w:p> -> строка; внутри <w:t> — текст; <w:tab/>,<w:br/> -> разделители
+    parts = []
+    for para in re.findall(r"<w:p\b.*?</w:p>", xml, re.S):
+        texts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", para, re.S)
+        line = "".join(texts)
+        line = (line.replace("&amp;", "&").replace("&lt;", "<")
+                    .replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'"))
+        if line.strip():
+            parts.append(line.strip())
+    return "\n".join(parts)
+
+
+def extract_request_items_from_text(text):
+    """Распознаёт заявку из ТЕКСТА (Word/Excel) -> {"items": [...]}. Тот же промпт."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    content = [{"type": "text", "text": REQUEST_PROMPT
+                + "\n\nНиже ТЕКСТ заявки (из Word/Excel). Разбери его как таблицу заявки:\n\n"
+                + text[:60000]}]
+    resp = client.messages.create(
+        model=CLAUDE_MODEL, max_tokens=8192,
+        messages=[{"role": "user", "content": content}],
+    )
+    out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    try:
+        data = parse_json(out)
+    except Exception:
+        return {"items": []}
+    return data if isinstance(data, dict) and "items" in data else {"items": []}
+
+
+def read_request_items(data, filename):
+    """Единая точка чтения заявки любого формата -> {"items":[...]}.
+    Excel/Word — через текст (точнее), PDF/картинки — через распознавание изображения."""
+    fn = (filename or "").lower()
+    try:
+        if fn.endswith((".xlsx", ".xlsm", ".xls")):
+            return extract_request_items_from_text(_request_xlsx_to_text(data))
+        if fn.endswith(".docx"):
+            return extract_request_items_from_text(_request_docx_to_text(data))
+        if fn.endswith((".txt", ".csv")):
+            txt = data.decode("utf-8", "ignore") if isinstance(data, (bytes, bytearray)) else str(data)
+            return extract_request_items_from_text(txt)
+    except Exception as e:
+        log.error("[request] не смог прочитать %s как текст: %s", filename, e)
+        # упадём в распознавание картинкой ниже
+    # PDF / JPG / PNG — старый путь через изображения
+    imgs = drawing_to_images(data, filename)
+    return extract_request_items(imgs)
 
 
 def extract_request_items(images_b64):
@@ -1427,16 +1497,24 @@ def process_order(order_id):
             pricelist = {}
             phase("PRICELIST_ERROR", error=str(e)[:300])
 
-        # --- Заявка: распознаём один раз на весь заказ ---
+        # --- Заявка: текст из формы (приоритет) или файл (PDF/картинки/Word/Excel) ---
         request_items = []
-        req_data = download_request(order)
-        if req_data:
+        req_text = (order.get(REQUEST_TEXT_COL) or "").strip()
+        if req_text:
             try:
-                req_imgs = drawing_to_images(req_data, order.get(REQUEST_PATH_COL, ""))
-                request_items = extract_request_items(req_imgs).get("items", [])
-                phase("REQUEST_PARSED", count=len(request_items))
+                request_items = extract_request_items_from_text(req_text).get("items", [])
+                phase("REQUEST_PARSED", count=len(request_items), source="text")
             except Exception as e:
                 phase("REQUEST_ERROR", error=str(e)[:300])
+        else:
+            req_data = download_request(order)
+            if req_data:
+                try:
+                    request_items = read_request_items(
+                        req_data, order.get(REQUEST_PATH_COL, "")).get("items", [])
+                    phase("REQUEST_PARSED", count=len(request_items), source="file")
+                except Exception as e:
+                    phase("REQUEST_ERROR", error=str(e)[:300])
 
         # --- Список чертежей: из order_drawings, иначе одиночный drawing_url ---
         draw_rows = load_order_drawings(order_id)
