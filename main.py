@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v14b-docx-tables-2026-06-20"
+WORKER_VERSION = "v15-mark-core-match-2026-06-20"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -662,19 +662,47 @@ def _norm_mark(s):
     return re.sub(r"[\s\-_.,]+", "", s)
 
 
+def _mark_cores(s):
+    """Достаёт «ядра марок» из строки: буква(ы)+цифры, напр.
+    «Траверс Б-2» -> {'б2'}; «Стойка ТС15» -> {'тс15'}; «ТМ-1, ТМ-2» -> {'тм1','тм2'}.
+    Возвращает множество нормализованных ядер."""
+    s = str(s or "").lower().replace("ё", "е")
+    cores = set()
+    # шаблоны вида: буквы + (необязат. дефис/пробел) + цифры  (Б2, ТС-15, ТМ 1, Т13.16)
+    for m in re.findall(r"[a-zа-я]{1,4}[\s\-]?\d+(?:[.\-]\d+)?", s):
+        cores.add(re.sub(r"[\s\-_.,]+", "", m))
+    return cores
+
+
 def match_request_to_drawing(request_items, drawing_mark):
     """Ищет в заявке количество для марки чертежа.
     Возвращает (qty, status, matched_item):
-      status: "green" — точное совпадение марки; "yellow" — частичное (одна в другой);
-              "red" — не найдено (qty=None)."""
+      status: "green" — надёжное совпадение; "yellow" — частичное; "red" — не найдено."""
     dn = _norm_mark(drawing_mark)
-    if not dn:
+    d_cores = _mark_cores(drawing_mark)
+    if not dn and not d_cores:
         return None, "red", None
-    # 1) точное совпадение нормализованных марок
+
+    # 1) точное совпадение нормализованных марок целиком
     for it in request_items:
-        if _norm_mark(it.get("mark")) == dn:
+        if dn and _norm_mark(it.get("mark")) == dn:
             return it.get("qty"), "green", it
-    # 2) частичное: марка чертежа входит в марку заявки или наоборот (>=3 симв.)
+
+    # 2) совпадение по «ядру марки» (Б2 == Б-2, ТС15 == ТС-15) — надёжно -> green.
+    #    Сравниваем ядра из марки чертежа с ядрами из марки И наименования заявки.
+    if d_cores:
+        core_hits = []
+        for it in request_items:
+            it_cores = _mark_cores(it.get("mark")) | _mark_cores(it.get("name"))
+            if d_cores & it_cores:   # пересечение ядер
+                core_hits.append(it)
+        if len(core_hits) == 1:
+            return core_hits[0].get("qty"), "green", core_hits[0]
+        if len(core_hits) > 1:
+            # несколько кандидатов с тем же ядром — не угадываем, отдаём менеджеру
+            return None, "yellow", None
+
+    # 3) запасной вариант: вхождение нормализованных строк (>=3 симв.) -> yellow
     cand = []
     for it in request_items:
         mn = _norm_mark(it.get("mark"))
