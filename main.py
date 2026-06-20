@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v11-code-aggregate-2026-06-19"
+WORKER_VERSION = "v12-multi-drawings-2026-06-19"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -377,6 +377,30 @@ def download_drawing(order):
     if not path:
         raise RuntimeError(f"в заказе нет {DRAWING_PATH_COL}")
     return sb.storage.from_(DRAWINGS_BUCKET).download(path)
+
+
+def download_drawing_by_path(path):
+    return sb.storage.from_(DRAWINGS_BUCKET).download(path)
+
+
+def load_order_drawings(order_id):
+    """Список чертежей заказа из order_drawings (отсортирован по position_index).
+    Если таблица пустая для заказа — вернёт []."""
+    try:
+        res = (sb.table("order_drawings")
+               .select("*").eq("order_id", order_id)
+               .order("position_index").execute())
+        return res.data or []
+    except Exception as e:
+        log.error("[multi] не удалось прочитать order_drawings: %s", e)
+        return []
+
+
+def update_order_drawing(row_id, fields):
+    try:
+        sb.table("order_drawings").update(fields).eq("id", row_id).execute()
+    except Exception as e:
+        log.error("[multi] не удалось обновить order_drawings %s: %s", row_id, e)
 
 
 def upload_result(path, data):
@@ -895,6 +919,130 @@ def _norm_key(name):
     return s
 
 
+def _resolve_one_material(raw, grade, svod_index, price_map, dopisat):
+    """Разрешает один сортамент в (имя, цвет, коммент) по «Сводной». Выносено из
+    build_raschet_cells, используется и одиночным, и мульти-заполнением."""
+    uncertain = False
+    typ = _parse_profile(raw)[0]
+    dim0 = (_parse_profile(raw)[1] or [None])[0]
+    name, mark, comment = raw, None, ""
+    if svod_index:
+        resolved, how = resolve_to_svodnaya(raw, grade, svod_index)
+        if how == "точно":
+            name, mark = resolved, None
+            if typ == "УГОЛОК" and _parse_profile(raw)[3] == "неравн":
+                mark = "yellow"
+                comment = f"Неравнополочный уголок сведён к равнополочному {resolved}. Проверить."
+        elif how == "гнутый":
+            a = [x.replace(",", ".") for x in re.findall(r"\d+(?:[.,]\d+)?", raw)]
+            def _f(v):
+                return str(int(float(v))) if float(v).is_integer() else v
+            body = "*".join(_f(x) for x in a) if a else ""
+            real = f"Уголок {body}".strip()
+            if "гнут" not in real.lower():
+                real += " гнутый"
+            name, mark = real, "red"
+            comment = "Гнутый уголок (нет стандартного с такой толщиной полки). Запросить цену у менеджера."
+        elif how == "аналог":
+            if typ == "ЛИСТ":
+                name, mark = resolved, "yellow"
+                comment = f"Лист заменён на ближайший: {resolved}."
+            elif typ in ("ТРУБА_ПРОФ", "ТРУБА_КРУГ"):
+                name, mark = raw, "orange"
+                dopisat.append((raw, price_map.get(resolved)))
+                comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
+            elif typ == "УГОЛОК":
+                name, mark = resolved, "yellow"
+                comment = f"Уголок заменён на ближайший стандартный: {resolved}. Цена от него."
+            else:
+                real = make_real_name(dim0, resolved, typ) if dim0 else raw
+                name, mark = real, "orange"
+                dopisat.append((real, price_map.get(resolved)))
+                comment = f"Нет в базе. Цена от аналога {resolved}. Проверить."
+        else:
+            name, mark = raw, "red"
+            comment = "Не найдено в базе. Проверить и добавить цену."
+    return name, mark, comment
+
+
+def build_raschet_cells_multi(products, svod_index=None, price_map=None):
+    """Заполнение НЕСКОЛЬКИХ изделий: каждое — своя строка (6,7,8…),
+    материалы — общие столбцы (N,O,P…) на весь заказ.
+    products = [{"mark": str, "qty": int, "positions": [..]}, ...]
+    Возвращает (cells, notes, dopisat, summary, per_product) как build_raschet_cells,
+    плюс per_product = [{"row":r,"mark":..,"mass":..}] для самопроверки.
+    """
+    price_map = price_map or {}
+    cells = {}
+    notes, dopisat = [], []
+    summary = {"yellow": 0, "orange": 0, "red": 0}
+    per_product = []
+
+    # 1) общая карта материал -> столбец (по порядку появления во всех изделиях)
+    col_of = {}        # _norm_key(имя) -> столбец
+    mat_meta = {}      # _norm_key -> (имя, mark, comment)
+    next_col = 0
+
+    ROW0 = 6
+    for pi, prod in enumerate(products):
+        row = ROW0 + pi
+        if row - ROW0 >= 20:        # ограничение: до 20 изделий
+            break
+        mark_name = prod.get("mark") or prod.get("name") or f"Изделие {pi+1}"
+        qty = prod.get("qty") or 1
+        cells[f"C{row}"] = (mark_name, "s", None)
+        cells[f"D{row}"] = (prod.get("drawing") or "", "s", None)
+        cells[f"I{row}"] = ("шт", "s", None)
+        cells[f"J{row}"] = (qty, "n", None)
+
+        # масса каждого материала этого изделия
+        per_mat = {}    # столбец -> масса
+        for p in prod.get("positions", []):
+            raw = match_sortament(p.get("sortament") or p.get("name") or "")
+            if not raw:
+                continue
+            try:
+                mass = float(p.get("mass_kg") or p.get("mass") or 0)
+            except (TypeError, ValueError):
+                mass = 0.0
+            if mass <= 0:
+                continue
+            grade = str(p.get("grade") or "")
+            name, mk, comment = _resolve_one_material(raw, grade, svod_index, price_map, dopisat)
+            key = _norm_key(name)
+            if key not in col_of:
+                if next_col >= len(STEEL_COLUMNS):
+                    continue   # столбцы кончились — пропускаем (предупреждение в summary)
+                col_of[key] = STEEL_COLUMNS[next_col]
+                mat_meta[key] = (name, mk, comment)
+                next_col += 1
+                if mk:
+                    notes.append({"исходное": raw, "имя": name, "пометка": mk, "коммент": comment})
+                    if mk in summary:
+                        summary[mk] += 1
+            col = col_of[key]
+            per_mat[col] = per_mat.get(col, 0.0) + mass
+
+        # пишем массы материалов в строку этого изделия
+        total = 0.0
+        for col, m in per_mat.items():
+            cells[f"{col}{row}"] = (round(m, 2), "n", None)
+            total += m
+        cells[f"K{row}"] = (round(total, 2), "n", None)
+        per_product.append({"row": row, "mark": mark_name, "mass": round(total, 2),
+                            "qty": qty, "control": prod.get("control_total_kg"),
+                            "weld_pct": prod.get("weld_pct")})
+
+    # шапка материалов (строка 5) + комментарии (строка 1)
+    for key, col in col_of.items():
+        name, mk, comment = mat_meta[key]
+        cells[f"{col}5"] = (name, "s", mk)
+        if comment:
+            cells[f"{col}1"] = (comment, "s", None)
+
+    return cells, notes, dopisat, summary, per_product
+
+
 def build_raschet_cells(positions, drawing_name, svod_index=None, price_map=None):
     """
     Возвращает (cells, notes, dopisat, summary).
@@ -1045,14 +1193,20 @@ def apply_catalog_to_template(xlsx_bytes, catalog):
         return xlsx_bytes
 
 
-def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None, pricelist=None):
+def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None, pricelist=None, products=None):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
     entries, free_rows = read_svodnaya_full(xlsx_bytes)
     price_map = {nm: pr for _, nm, pr in entries}
     svod_index = build_svodnaya_index([nm for _, nm, _ in entries])
-    cells, notes, dopisat, summary = build_raschet_cells(positions, drawing_name, svod_index, price_map)
+    per_product = None
+    if products:
+        cells, notes, dopisat, summary, per_product = build_raschet_cells_multi(
+            products, svod_index, price_map)
+    else:
+        cells, notes, dopisat, summary = build_raschet_cells(
+            positions, drawing_name, svod_index, price_map)
 
     # стили цветов: для каждой помечаемой ячейки клонируем ЕЁ СОБСТВЕННЫЙ стиль
     # (шрифт, перенос, рамка) и только меняем заливку — формат ячейки сохраняется
@@ -1175,12 +1329,77 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
             continue
         zout.writestr(zi, parts[zi.filename])
     zout.close()
-    return out.getvalue(), notes, summary
+    return out.getvalue(), notes, summary, per_product
 
 
 # ---------------------------------------------------------------------------
 # Фоновая обработка
 # ---------------------------------------------------------------------------
+def recognize_one_drawing(draw_bytes, filename, request_items, phase):
+    """Распознаёт ОДИН чертёж -> product dict для мульти-заполнения:
+       {mark, drawing, qty, positions, control_total_kg, weld_pct, check}.
+    request_items — распознанная заявка (для подстановки количества по марке)."""
+    import os as _os
+    images = drawing_to_images(draw_bytes, filename)
+    phase("CLAUDE_CALL", pages=len(images), file=_os.path.basename(filename), model=CLAUDE_MODEL)
+    t = time.time()
+    data = extract_positions(images)
+    positions = data.get("positions") or []
+    phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=len(positions))
+
+    # ТИП 2: суммируем по сортаменту в коде
+    if len(positions) > len(_uniq_sortaments(positions)):
+        positions = _aggregate_by_sortament(positions)
+        phase("AGGREGATED", groups=len(positions))
+
+    # марка изделия (для строки C и связки с заявкой)
+    fname_mark = _os.path.splitext(_os.path.basename(filename))[0].replace("_", " ")
+    mark = data.get("mark") or data.get("drawing") or fname_mark
+
+    # количество из заявки по марке (только зелёная связка)
+    qty = 1
+    if request_items:
+        q, qstatus, matched = match_request_to_drawing(request_items, mark)
+        phase("REQUEST_MATCH", drawing_mark=str(mark)[:60], qty=q, status=qstatus,
+              matched_mark=(matched or {}).get("mark"))
+        if qstatus == "green" and q:
+            qty = q
+
+    # самопроверка массы (с поправкой на сварку, вычет один раз)
+    sum_mass = round(sum(
+        float(p.get("mass_kg") or p.get("mass") or 0)
+        for p in positions
+        if _safe_float(p.get("mass_kg") or p.get("mass")) > 0), 2)
+    control = _safe_float(data.get("control_total_kg")) or None
+    weld_pct = _safe_float(data.get("weld_pct")) or None
+    control_noweld = control
+    if control and weld_pct:
+        control_noweld = round(control / (1.0 + weld_pct / 100.0), 2)
+    if control_noweld and control_noweld > 0:
+        diff_pct = round(abs(sum_mass - control_noweld) / control_noweld * 100, 1)
+        cstatus = "CHECK_OK" if diff_pct <= 1.0 else "CHECK_MISMATCH"
+    else:
+        diff_pct = None
+        cstatus = "CHECK_NO_CONTROL"
+    phase(cstatus, mark=str(mark)[:60], sum_mass_kg=sum_mass,
+          control_no_weld_kg=control_noweld, diff_pct=diff_pct)
+
+    return {
+        "mark": mark, "drawing": data.get("drawing") or "",
+        "qty": qty, "positions": positions,
+        "control_total_kg": control, "weld_pct": weld_pct,
+        "mass_kg": sum_mass, "control_no_weld_kg": control_noweld,
+        "diff_pct": diff_pct, "check_status": cstatus,
+    }
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def process_order(order_id):
     order = fetch_order(order_id)
     entries = order.get(LOG_COL) or []
@@ -1208,25 +1427,7 @@ def process_order(order_id):
             pricelist = {}
             phase("PRICELIST_ERROR", error=str(e)[:300])
 
-        phase("LOAD_DRAWING")
-        draw = download_drawing(order)
-
-        phase("RASTERIZE")
-        images = drawing_to_images(draw, order.get(DRAWING_PATH_COL, ""))
-
-        phase("CLAUDE_CALL", pages=len(images), model=CLAUDE_MODEL)
-        t = time.time()
-        data = extract_positions(images)
-        positions = data.get("positions") or []
-        phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=len(positions))
-
-        # ТИП 2 (деталировка): модель вернула позиции построчно. Суммируем массы
-        # по сортаменту в КОДЕ (надёжнее, чем доверять сложение модели).
-        if len(positions) > len(_uniq_sortaments(positions)):
-            positions = _aggregate_by_sortament(positions)
-            phase("AGGREGATED", groups=len(positions))
-
-        # --- Заявка: распознаём и подставляем количество по марке чертежа ---
+        # --- Заявка: распознаём один раз на весь заказ ---
         request_items = []
         req_data = download_request(order)
         if req_data:
@@ -1237,74 +1438,47 @@ def process_order(order_id):
             except Exception as e:
                 phase("REQUEST_ERROR", error=str(e)[:300])
 
-        if request_items:
-            import os as _os
-            fname = _os.path.basename(order.get(DRAWING_PATH_COL, "") or "")
-            fname_mark = _os.path.splitext(fname)[0].replace("_", " ")
-            drawing_mark = data.get("mark") or data.get("drawing") or fname_mark
-            qty, qstatus, matched = match_request_to_drawing(request_items, drawing_mark)
-            phase("REQUEST_MATCH", drawing_mark=str(drawing_mark)[:60],
-                  qty=qty, status=qstatus,
-                  matched_mark=(matched or {}).get("mark"))
-            # подставляем количество только при надёжной (зелёной) связке;
-            # жёлтую/красную оставляем менеджеру (qty не трогаем автоматически)
-            if qstatus == "green" and qty:
-                for p in positions:
-                    p["qty_from_request"] = qty
-        # --------------------------------------------------------------------
-
-        # --- Самопроверка: сумма масс vs «Итого масса металла» из таблицы ---
-        sum_mass = 0.0
-        for p in positions:
-            try:
-                m = float(p.get("mass_kg") or p.get("mass") or 0)
-            except (TypeError, ValueError):
-                m = 0.0
-            if m > 0:
-                sum_mass += m
-        sum_mass = round(sum_mass, 2)
-        try:
-            control = data.get("control_total_kg")
-            control = float(control) if control is not None else None
-        except (TypeError, ValueError):
-            control = None
-
-        # Сварка: металл считаем БЕЗ швов. Если контрольная масса дана СО сваркой,
-        # вычитаем % сварки, чтобы сравнивать сопоставимое и не искать «потерянные»
-        # детали там, где разница — это сварные швы.
-        try:
-            weld_pct = float(data.get("weld_pct")) if data.get("weld_pct") is not None else None
-        except (TypeError, ValueError):
-            weld_pct = None
-        control_noweld = control
-        if control and weld_pct:
-            # масса_элемента = детали + детали*weld%  =>  детали = масса / (1 + weld/100)
-            control_noweld = round(control / (1.0 + weld_pct / 100.0), 2)
-
-        check = {"sum_mass_kg": sum_mass, "control_total_kg": control,
-                 "weld_pct": weld_pct, "control_no_weld_kg": control_noweld}
-        if control_noweld and control_noweld > 0:
-            diff_pct = round(abs(sum_mass - control_noweld) / control_noweld * 100, 1)
-            check["diff_pct"] = diff_pct
-            # допуск 1% — масса в спецификации дана с учётом отходов
-            check["ok"] = diff_pct <= 1.0
-            check_status = "CHECK_OK" if check["ok"] else "CHECK_MISMATCH"
-            if not check["ok"]:
-                check["note"] = (f"сумма деталей {sum_mass} кг отличается от контрольной "
-                                 f"{control_noweld} кг (без сварки) на {diff_pct}% — "
-                                 f"проверьте, не пропущена ли позиция спецификации")
+        # --- Список чертежей: из order_drawings, иначе одиночный drawing_url ---
+        draw_rows = load_order_drawings(order_id)
+        if draw_rows:
+            phase("DRAWINGS_FOUND", count=len(draw_rows))
+            sources = [(r.get("drawing_url"), r) for r in draw_rows if r.get("drawing_url")]
         else:
-            check["ok"] = None
-            check["note"] = "контрольный итог не найден — проверьте вручную"
-            check_status = "CHECK_NO_CONTROL"
-        phase(check_status, **check)
-        needs_review = check.get("ok") is not True
-        # --------------------------------------------------------------------
+            phase("DRAWINGS_FOUND", count=1, mode="single")
+            sources = [(order.get(DRAWING_PATH_COL), None)]
+
+        products = []
+        for path, drow in sources:
+            try:
+                phase("LOAD_DRAWING", file=path)
+                db = download_drawing_by_path(path) if drow else download_drawing(order)
+                prod = recognize_one_drawing(db, path or "", request_items, phase)
+                products.append(prod)
+                # статус по каждому изделию -> в order_drawings (если запись есть)
+                if drow:
+                    update_order_drawing(drow["id"], {
+                        "mark": prod["mark"], "qty": prod["qty"],
+                        "mass_kg": prod["mass_kg"], "control_kg": prod["control_no_weld_kg"],
+                        "diff_pct": prod["diff_pct"], "check_status": prod["check_status"],
+                    })
+            except Exception as e:
+                phase("DRAWING_ERROR", file=path, error=str(e)[:300])
+
+        if not products:
+            raise RuntimeError("не удалось распознать ни одного чертежа")
+
+        # общий статус проверки: худший по изделиям
+        statuses = [p["check_status"] for p in products]
+        needs_review = any(s != "CHECK_OK" for s in statuses)
+        overall = ("CHECK_MISMATCH" if "CHECK_MISMATCH" in statuses
+                   else ("CHECK_NO_CONTROL" if "CHECK_NO_CONTROL" in statuses else "CHECK_OK"))
+        phase("MASS_CHECK_OVERALL", status=overall, products=len(products),
+              total_mass=round(sum(p["mass_kg"] for p in products), 2))
 
         phase("FILL_EXCEL")
-        drawing_name = data.get("drawing") or order.get(DRAWING_PATH_COL, "")
         overrides = load_overrides(order_id)
-        filled, notes, summary = fill_template(tpl, positions, drawing_name, overrides, catalog, pricelist)
+        filled, notes, summary, per_product = fill_template(
+            tpl, [], "", overrides, catalog, pricelist, products=products)
         if notes:
             phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
         review_total = summary["yellow"] + summary["orange"] + summary["red"]
@@ -1314,6 +1488,11 @@ def process_order(order_id):
         path = f"{order_id}.xlsx"
         upload_result(path, filled)
         result_fields = {RESULT_PATH_COL: path, STATUS_COL: STATUS_DONE}
+
+        total_mass = round(sum(p["mass_kg"] for p in products), 2)
+        worst = next((p for p in products if p["check_status"] == "CHECK_MISMATCH"),
+                     next((p for p in products if p["check_status"] == "CHECK_NO_CONTROL"),
+                          products[0]))
         # сводка на проверку для дашборда (поля могут отсутствовать в схеме — пишем мягко)
         try:
             db_update(order_id, {
@@ -1322,27 +1501,27 @@ def process_order(order_id):
                 "review_yellow": summary["yellow"],
                 "review_orange": summary["orange"],
                 "review_red": summary["red"],
-                # контроль массы (без сварки) — для показа в карточке заказа
-                "mass_sum_kg": check.get("sum_mass_kg"),
-                "mass_control_kg": check.get("control_no_weld_kg"),
-                "mass_diff_pct": check.get("diff_pct"),
-                "mass_check_status": check_status,   # CHECK_OK / CHECK_MISMATCH / CHECK_NO_CONTROL
-                "weld_pct": check.get("weld_pct"),
+                # контроль массы по заказу: суммарная масса + статус (худший по изделиям)
+                "mass_sum_kg": total_mass,
+                "mass_control_kg": worst.get("control_no_weld_kg"),
+                "mass_diff_pct": worst.get("diff_pct"),
+                "mass_check_status": overall,
+                "weld_pct": worst.get("weld_pct"),
             })
         except Exception:
             db_update(order_id, result_fields)  # если полей нет в схеме — хотя бы статус
 
         phase("DONE", ms=int((time.time() - t0) * 1000),
-              needs_review=needs_review, mass_check=check)
+              needs_review=needs_review, products=len(products), total_mass=total_mass)
 
         log_run(
-            drawing_name    = drawing_name,
+            drawing_name    = ", ".join(p["mark"] for p in products)[:200],
             request_id      = order_id,
-            check_status    = "OK" if check.get("ok") is True
-                              else ("MISMATCH" if check.get("ok") is False else "NO_CONTROL"),
-            positions_count = len(positions),
-            sum_mass        = sum_mass,
-            expected_total  = control,
+            check_status    = "OK" if overall == "CHECK_OK"
+                              else ("MISMATCH" if overall == "CHECK_MISMATCH" else "NO_CONTROL"),
+            positions_count = sum(len(p["positions"]) for p in products),
+            sum_mass        = total_mass,
+            expected_total  = worst.get("control_no_weld_kg"),
             review          = {"total":  review_total,
                                "yellow": summary["yellow"],
                                "orange": summary["orange"],
