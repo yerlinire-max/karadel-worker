@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v14-request-text-field-2026-06-20"
+WORKER_VERSION = "v14b-docx-tables-2026-06-20"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -542,20 +542,46 @@ def _request_xlsx_to_text(data):
 
 
 def _request_docx_to_text(data):
-    """Word-заявка -> текст (абзацы + таблицы). docx — это zip с word/document.xml."""
+    """Word-заявка -> текст. Извлекает и абзацы, и ТАБЛИЦЫ (построчно, ячейки через |).
+    Это важно: в заявках позиции обычно лежат в таблице Word."""
     import zipfile, io as _io
     z = zipfile.ZipFile(_io.BytesIO(data))
     xml = z.read("word/document.xml").decode("utf-8", "ignore")
-    # <w:p> -> строка; внутри <w:t> — текст; <w:tab/>,<w:br/> -> разделители
-    parts = []
-    for para in re.findall(r"<w:p\b.*?</w:p>", xml, re.S):
-        texts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", para, re.S)
-        line = "".join(texts)
-        line = (line.replace("&amp;", "&").replace("&lt;", "<")
-                    .replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'"))
-        if line.strip():
-            parts.append(line.strip())
-    return "\n".join(parts)
+
+    def _unescape(s):
+        return (s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                 .replace("&quot;", '"').replace("&#39;", "'"))
+
+    def _para_text(block):
+        # текст одного абзаца: все <w:t>, табы/переводы строк как пробелы
+        block = re.sub(r"<w:tab\b[^>]*/>", " ", block)
+        block = re.sub(r"<w:br\b[^>]*/>", " ", block)
+        return _unescape("".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", block, re.S))).strip()
+
+    def _cell_text(tc):
+        # текст ячейки = склейка её абзацев
+        paras = re.findall(r"<w:p\b.*?</w:p>", tc, re.S)
+        return " ".join(t for t in (_para_text(p) for p in paras) if t).strip()
+
+    lines = []
+    # идём по документу последовательно: и таблицы, и абзацы вне таблиц
+    # 1) таблицы -> строки "ячейка | ячейка | ..."
+    for tbl in re.findall(r"<w:tbl>.*?</w:tbl>", xml, re.S):
+        for tr in re.findall(r"<w:tr\b.*?</w:tr>", tbl, re.S):
+            cells = re.findall(r"<w:tc>.*?</w:tc>", tr, re.S)
+            vals = [_cell_text(c) for c in cells]
+            if any(vals):
+                lines.append(" | ".join(vals))
+    # 2) текст вне таблиц (заголовок/контекст): убираем таблицы, картинки, теги
+    no_tbl = re.sub(r"<w:tbl>.*?</w:tbl>", "", xml, flags=re.S)
+    no_tbl = re.sub(r"<w:drawing>.*?</w:drawing>", "", no_tbl, flags=re.S)
+    no_tbl = re.sub(r"<w:tab\b[^>]*/>", " ", no_tbl)
+    extra = _unescape(" ".join(re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", no_tbl, re.S)))
+    extra = re.sub(r"<[^>]+>", " ", extra)          # на всякий случай выкидываем любые теги
+    extra = re.sub(r"\s{2,}", " ", extra).strip()
+    if extra:
+        lines.append(extra)
+    return "\n".join(lines)
 
 
 def extract_request_items_from_text(text):
