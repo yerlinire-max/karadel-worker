@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v20-adaptive-render-2026-06-23"
+WORKER_VERSION = "v21-split-izdelia-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -523,7 +523,12 @@ TABLE_READ_RULES = """КАК ЧИТАТЬ ТАБЛИЦУ СПЕЦИФИКАЦИ�
   считай как mass_kg = «Масса ед.» × «Кол.». (Пример: Кол.=2, Масса ед.=83,2 → 166,4.)
 - На листе может быть НЕСКОЛЬКО изделий, разделённых строками-заголовками
   (напр. «Площадка ПЛ1», «Накладка Н1», «Короб К1»). Выпиши позиции ВСЕХ изделий
-  этого листа — программа их сложит. НЕ пропускай ни одной строки (их может быть 20+).
+  этого листа. НЕ пропускай ни одной строки (их может быть 20+).
+- Для КАЖДОЙ позиции добавь поле "izdelie" — название изделия (заголовок раздела),
+  под которым стоит строка (напр. "Площадка ПЛ1", "Накладка Н1", "Короб К1").
+- Верни также массив "izdelia" — заявленные массы изделий из строк-заголовков
+  (для контроля), напр. "izdelia":[{"name":"Площадка ПЛ1","mass_kg":1549.3},
+  {"name":"Накладка Н1","mass_kg":90.15},{"name":"Короб К1","mass_kg":123.44}].
 - НЕ включай строку «Наплавленный металл» (это сварка, не сортамент).
 - НЕ включай строки-заголовки изделий и строку «Итого».
 - В столбце «Обозначение» может стоять ссылка на ДРУГОЙ чертёж (напр. «43-2023-ЭВ2,
@@ -1704,6 +1709,43 @@ def _finalize_product(data, filename, request_items, phase, mark_default=None):
     }
 
 
+def _split_sheet_into_products(data, filename, request_items, phase, sheet, seen_all):
+    """Делит прочитанный лист на ОТДЕЛЬНЫЕ изделия по полю "izdelie".
+    Если разметки нет — одно изделие «Лист N» (как раньше). Каждое изделие
+    получает свой контроль из заявленных масс "izdelia"."""
+    positions = data.get("positions") or []
+    izd_mass = {}
+    for it in (data.get("izdelia") or []):
+        nm = str(it.get("name") or "").strip()
+        m = _safe_float(it.get("mass_kg"))
+        if nm and m > 0:
+            izd_mass[nm] = m
+
+    # группируем позиции по изделию (сохраняя порядок появления)
+    groups, order = {}, []
+    for p in positions:
+        key = str(p.get("izdelie") or "").strip() or f"Лист {sheet}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(p)
+
+    out = []
+    for name in order:
+        sub = {
+            "positions": groups[name],
+            "mark": name,
+            "drawing": data.get("drawing") or "",
+            "weld_pct": data.get("weld_pct"),
+            "control_total_kg": izd_mass.get(name),
+        }
+        prod = _finalize_product(sub, filename, request_items, phase, mark_default=name)
+        prod["sheet"] = sheet
+        prod["sheets_seen"] = seen_all
+        out.append(prod)
+    return out
+
+
 def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_sheets=None):
     """Распознаёт чертёж -> СПИСОК product dict (одно изделие = одна строка Расчёта).
     Если указаны target_sheets (напр. [28, 30]) — каждый лист читается ОТДЕЛЬНЫМ
@@ -1759,11 +1801,10 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_she
                 phase("SHEET_EMPTY", sheet=sheet, sheets_seen=seen_all,
                       in_map=(key in pmap))
                 continue
-            prod = _finalize_product(data, filename, request_items, phase,
-                                     mark_default=f"Лист {sheet}")
-            prod["sheet"] = sheet
-            prod["sheets_seen"] = seen_all
-            products.append(prod)
+            sheet_prods = _split_sheet_into_products(
+                data, filename, request_items, phase, sheet, seen_all)
+            phase("SHEET_SPLIT", sheet=sheet, izdelia=[p["mark"] for p in sheet_prods])
+            products.extend(sheet_prods)
         if not products:
             return [{
                 "mark": "ЛИСТ НЕ НАЙДЕН", "drawing": "", "qty": 1, "positions": [],
