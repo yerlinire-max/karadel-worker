@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v21-split-izdelia-2026-06-23"
+WORKER_VERSION = "v22-fix-format-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -505,7 +505,8 @@ def extract_positions(images_b64, target_sheets=None, preselected=False):
     if target_sheets:
         sheets_str = ", ".join(str(s) for s in target_sheets)
         pref = SHEET_READ_PREFIX if preselected else SHEET_FILTER_PREFIX
-        prompt = pref.format(sheets=sheets_str) + EXTRACTION_PROMPT
+        # .replace, а НЕ .format: в подсказке есть пример JSON с фигурными скобками
+        prompt = pref.replace("{sheets}", sheets_str) + EXTRACTION_PROMPT
     content.append({"type": "text", "text": prompt})
     resp = client.messages.create(
         model=CLAUDE_MODEL,
