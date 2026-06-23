@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v18-sheet-table-diag-2026-06-23"
+WORKER_VERSION = "v20-adaptive-render-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -81,6 +81,9 @@ PRICELIST_PATH = os.environ.get("PRICELIST_PATH", "metall.xlsx")
 TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "")
 
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "15"))
+# Порог «большого формата» в пунктах (1700 ≈ больше А2). Крупнее — сразу тяжёлый
+# рендер с тайлами; мельче — сначала лёгкий проход, тяжёлый только если не прочиталось.
+LARGE_FMT_PT = float(os.environ.get("LARGE_FMT_PT", "1700"))
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # ВАЖНО: вставьте сюда ваш рабочий промпт распознавания чертежа из Lovable.
@@ -492,7 +495,7 @@ def _aggregate_by_sortament(positions):
     return out
 
 
-def extract_positions(images_b64, target_sheets=None):
+def extract_positions(images_b64, target_sheets=None, preselected=False):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     content = [
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
@@ -500,42 +503,31 @@ def extract_positions(images_b64, target_sheets=None):
     ]
     prompt = EXTRACTION_PROMPT
     if target_sheets:
-        prompt = SHEET_FILTER_PREFIX.format(sheets=", ".join(str(s) for s in target_sheets)) + EXTRACTION_PROMPT
+        sheets_str = ", ".join(str(s) for s in target_sheets)
+        pref = SHEET_READ_PREFIX if preselected else SHEET_FILTER_PREFIX
+        prompt = pref.format(sheets=sheets_str) + EXTRACTION_PROMPT
     content.append({"type": "text", "text": prompt})
     resp = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=8192,
         messages=[{"role": "user", "content": content}],
     )
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
     return parse_json(text)
 
 
-# Префикс к EXTRACTION_PROMPT, когда менеджер указал конкретные листы
-# (например «посчитай лист 28, 30»). Заставляет модель читать металл ТОЛЬКО
-# со страниц, где в ШТАМПЕ стоит нужный номер листа.
-SHEET_FILTER_PREFIX = """ОГРАНИЧЕНИЕ ПО ЛИСТАМ — ВЫПОЛНИ В ПЕРВУЮ ОЧЕРЕДЬ.
-Тебя просят рассчитать ТОЛЬКО лист(ы): {sheets}.
-Номер листа написан в ШТАМПЕ чертежа — в рамке справа внизу, в графе «Лист»
-(она между графами «Стадия» и «Листов»). Это НЕ номер страницы файла и НЕ
-«лист NN» из столбца «Обозначение» (там это ссылка на другой чертёж). Сверяйся
-ТОЛЬКО со штампом страницы.
-
-ПОРЯДОК:
-1) Просмотри ВСЕ страницы. Для каждой посмотри в штамп графу «Лист».
-2) Возьми в работу только страницу(ы), где в штампе стоит один из номеров: {sheets}.
-3) Спецификацию металла читай ТОЛЬКО с этих страниц. С остальных — ничего.
-4) Если нужного номера в штампах нет — верни "positions": [] и "control_total_kg": null.
-
-КАК ЧИТАТЬ ТАБЛИЦУ СПЕЦИФИКАЦИИ НА ЭТОМ ЛИСТЕ (столбцы:
+# Общие правила чтения таблицы спецификации листа (для обоих режимов).
+TABLE_READ_RULES = """КАК ЧИТАТЬ ТАБЛИЦУ СПЕЦИФИКАЦИИ (столбцы:
 Поз. | Обозначение | Наименование | Кол. | Масса ед., кг | Примечание):
 - МАССА: в столбце стоит «Масса ед.» — это масса ОДНОЙ детали. Массу позиции
   считай как mass_kg = «Масса ед.» × «Кол.». (Пример: Кол.=2, Масса ед.=83,2 → 166,4.)
 - На листе может быть НЕСКОЛЬКО изделий, разделённых строками-заголовками
   (напр. «Площадка ПЛ1», «Накладка Н1», «Короб К1»). Выпиши позиции ВСЕХ изделий
-  этого листа — программа их сложит.
+  этого листа — программа их сложит. НЕ пропускай ни одной строки (их может быть 20+).
 - НЕ включай строку «Наплавленный металл» (это сварка, не сортамент).
 - НЕ включай строки-заголовки изделий и строку «Итого».
+- В столбце «Обозначение» может стоять ссылка на ДРУГОЙ чертёж (напр. «43-2023-ЭВ2,
+  лист 19») — это нормально, ИГНОРИРУЙ её и всё равно читай таблицу.
 - Сортамент (sortament) переводи как в «Сводной»:
   • «Швеллер 12», «[12» → "Швеллер 12";  «Швеллер 8» → "Швеллер 8"
   • «Уголок 90х7», «L90x7» → "Уголок 90x7";  «Уголок 80х6» → "Уголок 80x6";
@@ -544,10 +536,33 @@ SHEET_FILTER_PREFIX = """ОГРАНИЧЕНИЕ ПО ЛИСТАМ — ВЫПОЛ
   • листовая сталь «Сталь 660х3 … лист», «660x3» (толщина — наименьший размер, тут 3)
     → "Лист 3";  «900х3 … лист» → "Лист 3"
   • «Сетка №35 …» → "Сетка 35"
+"""
 
-ДОПОЛНИТЕЛЬНО (для диагностики) верни поле "sheets_seen" — массив ВСЕХ номеров
-листов, которые ты увидел в штампах страниц этого файла (как строки), напр.
-"sheets_seen": ["5","5.1","29","30"].
+# Режим А: страница листа УЖЕ отобрана (даны её фрагменты-тайлы). Штамп искать
+# не нужно — просто прочитать таблицу целиком.
+SHEET_READ_PREFIX = """ВАЖНО: эти изображения — фрагменты ОДНОГО листа № {sheets},
+он уже отобран по штампу. Тебе НЕ нужно искать штамп или другие листы.
+Просто прочитай таблицу спецификации металла этого листа ПОЛНОСТЬЮ.
+
+""" + TABLE_READ_RULES + """
+ДОПОЛНИТЕЛЬНО верни "sheets_seen": ["{sheets}"].
+=====================================================================
+
+"""
+
+# Режим Б (запасной): страница не отобрана — даны все страницы, надо найти лист
+# по ШТАМПУ самому.
+SHEET_FILTER_PREFIX = """ОГРАНИЧЕНИЕ ПО ЛИСТАМ — ВЫПОЛНИ В ПЕРВУЮ ОЧЕРЕДЬ.
+Тебя просят рассчитать ТОЛЬКО лист(ы): {sheets}.
+Номер листа написан в ШТАМПЕ чертежа — рамка справа внизу, графа «Лист»
+(между «Стадия» и «Листов»). Это НЕ номер страницы и НЕ «лист NN» из столбца
+«Обозначение». Сверяйся ТОЛЬКО со штампом.
+ПОРЯДОК:
+1) Найди страницу(ы), где в штампе стоит один из номеров: {sheets}.
+2) Читай спецификацию ТОЛЬКО с них. Если номера нет в штампах — "positions": [].
+
+""" + TABLE_READ_RULES + """
+ДОПОЛНИТЕЛЬНО верни "sheets_seen" — все номера листов из штампов страниц.
 =====================================================================
 
 """
@@ -649,6 +664,115 @@ def _request_docx_to_text(data):
     if extra:
         lines.append(extra)
     return "\n".join(lines)
+
+
+PAGE_MAP_PROMPT = """Тебе даны страницы чертежа по порядку (стр. 1, 2, 3 …).
+Для КАЖДОЙ страницы посмотри в ШТАМП — рамку справа внизу, графа «Лист»
+(между «Стадия» и «Листов»). Верни номер листа из этой графы.
+Верни СТРОГО JSON без пояснений:
+{"pages":[{"page":1,"sheet":"5"},{"page":2,"sheet":"5.1"},{"page":3,"sheet":"30"}]}
+Если на странице штампа/номера листа нет — "sheet": null. Только JSON."""
+
+
+def map_pages_to_sheets(images_b64):
+    """Один дешёвый проход: какой номер листа в штампе на каждой странице.
+    Возвращает dict {номер_листа(str): индекс_страницы(0-based)}."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    content = [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
+        for b in images_b64
+    ]
+    content.append({"type": "text", "text": PAGE_MAP_PROMPT})
+    resp = client.messages.create(
+        model=CLAUDE_MODEL, max_tokens=1024,
+        messages=[{"role": "user", "content": content}],
+    )
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    out = {}
+    try:
+        data = parse_json(text)
+        for rec in data.get("pages", []):
+            s = rec.get("sheet")
+            p = rec.get("page")
+            if s is None or p is None:
+                continue
+            key = str(s).strip().lower().replace("лист", "").strip()
+            try:
+                idx = int(p) - 1
+            except (TypeError, ValueError):
+                continue
+            if key and key not in out and idx >= 0:
+                out[key] = idx
+    except Exception:
+        return {}
+    return out
+
+
+def _page_long_side_pt(data, filename, page_index):
+    """Длинная сторона страницы в пунктах (1 пт = 1/72 дюйма). Для не-PDF — None."""
+    is_pdf = filename.lower().endswith(".pdf") or data[:4] == b"%PDF"
+    if not is_pdf:
+        return None
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        r = doc[page_index].rect
+        return max(r.width, r.height)
+    except Exception:
+        return None
+
+
+def render_page_single(data, filename, page_index, cap=1500):
+    """Лёгкий рендер ОДНОЙ страницы в одну картинку (как в обычном расчёте)."""
+    is_pdf = filename.lower().endswith(".pdf") or data[:4] == b"%PDF"
+    if not is_pdf:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+    else:
+        doc = fitz.open(stream=data, filetype="pdf")
+        page = doc[page_index]
+        long_side = max(page.rect.width, page.rect.height) or 1000
+        zoom = min(3.0, float(cap) / long_side)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    img.thumbnail((cap, cap))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=78)
+    return [base64.b64encode(buf.getvalue()).decode()]
+
+
+def render_page_tiles(data, filename, page_index, max_tile=1500, overlap=140):
+    """Рендерит ОДНУ страницу PDF в высоком разрешении и режет на тайлы ≤max_tile,
+    чтобы плотная таблица была читаемой. Возвращает список base64-JPEG."""
+    is_pdf = filename.lower().endswith(".pdf") or data[:4] == b"%PDF"
+    if not is_pdf:
+        # одиночная картинка — режем её саму
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+    else:
+        doc = fitz.open(stream=data, filetype="pdf")
+        page = doc[page_index]
+        long_side = max(page.rect.width, page.rect.height) or 1000
+        zoom = min(6.0, 3600.0 / long_side)   # выше, чем общий рендер (там 1500)
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+    W, H = img.size
+    if max(W, H) <= max_tile:
+        tiles = [img]
+    else:
+        step = max_tile - overlap
+        xs = list(range(0, max(W - overlap, 1), step)) or [0]
+        ys = list(range(0, max(H - overlap, 1), step)) or [0]
+        tiles = []
+        for y in ys:
+            for x in xs:
+                tile = img.crop((x, y, min(x + max_tile, W), min(y + max_tile, H)))
+                if tile.size[0] >= 60 and tile.size[1] >= 60:
+                    tiles.append(tile)
+    out = []
+    for t in tiles[:12]:                       # предохранитель: не более 12 тайлов
+        buf = io.BytesIO()
+        t.save(buf, "JPEG", quality=82)
+        out.append(base64.b64encode(buf.getvalue()).decode())
+    return out
 
 
 def extract_request_items_from_text(text):
@@ -1590,20 +1714,50 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_she
 
     if target_sheets:
         products = []
-        seen_all = []
+        # 1) карта: какой лист на какой странице (по штампу), дешёвый проход
+        try:
+            pmap = map_pages_to_sheets(images)
+        except Exception as e:
+            pmap = {}
+            phase("PAGEMAP_ERROR", error=str(e)[:200])
+        seen_all = sorted(pmap.keys()) if pmap else []
+        phase("PAGE_MAP", map={k: v + 1 for k, v in pmap.items()}, sheets_seen=seen_all)
+
         for sheet in target_sheets:
-            phase("CLAUDE_CALL", pages=len(images), file=base, model=CLAUDE_MODEL, sheet=sheet)
+            key = str(sheet).strip().lower()
             t = time.time()
-            data = extract_positions(images, target_sheets=[sheet])
-            seen = data.get("sheets_seen") or []
-            if seen and not seen_all:
-                seen_all = [str(s) for s in seen]
+            if key in pmap:
+                pidx = pmap[key]
+                long_pt = _page_long_side_pt(draw_bytes, filename, pidx)
+                is_large = bool(long_pt and long_pt > LARGE_FMT_PT)
+                if is_large:
+                    # большой формат — сразу тяжёлый рендер с тайлами
+                    imgs_read = render_page_tiles(draw_bytes, filename, pidx)
+                    mode = f"tiles(large,{len(imgs_read)})"
+                    data = extract_positions(imgs_read, target_sheets=[sheet], preselected=True)
+                else:
+                    # обычный формат — сначала лёгкий проход (дёшево)
+                    imgs_read = render_page_single(draw_bytes, filename, pidx)
+                    data = extract_positions(imgs_read, target_sheets=[sheet], preselected=True)
+                    mode = "single"
+                    if len(data.get("positions") or []) == 0:
+                        # таблица не прочиталась — эскалация в тяжёлый рендер
+                        imgs_read = render_page_tiles(draw_bytes, filename, pidx)
+                        mode = f"tiles(escalated,{len(imgs_read)})"
+                        data = extract_positions(imgs_read, target_sheets=[sheet], preselected=True)
+                phase("CLAUDE_CALL", file=base, model=CLAUDE_MODEL, sheet=sheet,
+                      page=pidx + 1, long_pt=round(long_pt or 0), mode=mode)
+            else:
+                # штамп этого листа не найден в карте — пробуем по всем страницам (запас)
+                phase("CLAUDE_CALL", file=base, model=CLAUDE_MODEL, sheet=sheet,
+                      page=None, mode="all-pages", note="лист не в карте штампов")
+                data = extract_positions(images, target_sheets=[sheet])
             n = len(data.get("positions") or [])
             phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=n,
                   sheet=sheet, sheets_seen=seen_all)
             if n == 0:
-                # лист не найден в штампе или пуст — пометка с тем, что реально видно
-                phase("SHEET_EMPTY", sheet=sheet, sheets_seen=seen_all)
+                phase("SHEET_EMPTY", sheet=sheet, sheets_seen=seen_all,
+                      in_map=(key in pmap))
                 continue
             prod = _finalize_product(data, filename, request_items, phase,
                                      mark_default=f"Лист {sheet}")
@@ -1611,8 +1765,6 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_she
             prod["sheets_seen"] = seen_all
             products.append(prod)
         if not products:
-            # ни один лист не дал позиций — вернём «пустышку» с диагностикой, чтобы
-            # в результат попало, какие листы реально есть в файле
             return [{
                 "mark": "ЛИСТ НЕ НАЙДЕН", "drawing": "", "qty": 1, "positions": [],
                 "control_total_kg": None, "weld_pct": None, "mass_kg": 0.0,
