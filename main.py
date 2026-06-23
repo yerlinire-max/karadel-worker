@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v16-sheet-filter-2026-06-23"
+WORKER_VERSION = "v17-per-sheet-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -1504,33 +1504,18 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
 # ---------------------------------------------------------------------------
 # Фоновая обработка
 # ---------------------------------------------------------------------------
-def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_sheets=None):
-    """Распознаёт ОДИН чертёж -> product dict для мульти-заполнения:
-       {mark, drawing, qty, positions, control_total_kg, weld_pct, check}.
-    request_items — распознанная заявка (для подстановки количества по марке).
-    target_sheets — список номеров листов (если менеджер указал «посчитай лист 28, 30»):
-       металл читается ТОЛЬКО с этих листов (по штампу)."""
+def _finalize_product(data, filename, request_items, phase, mark_default=None):
+    """Из ответа модели (data с positions/mark/control) собирает product dict
+    с самопроверкой массы. mark_default — имя изделия, если в штампе марки нет."""
     import os as _os
-    images = drawing_to_images(draw_bytes, filename)
-    phase("CLAUDE_CALL", pages=len(images), file=_os.path.basename(filename),
-          model=CLAUDE_MODEL, sheets=(target_sheets or None))
-    t = time.time()
-    data = extract_positions(images, target_sheets=target_sheets)
     positions = data.get("positions") or []
-    phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=len(positions))
-
     # ТИП 2: суммируем по сортаменту в коде
     if len(positions) > len(_uniq_sortaments(positions)):
         positions = _aggregate_by_sortament(positions)
         phase("AGGREGATED", groups=len(positions))
 
-    # марка изделия (для строки C и связки с заявкой)
     fname_mark = _os.path.splitext(_os.path.basename(filename))[0].replace("_", " ")
-    if target_sheets:
-        # читаем по листу: имя изделия = марка из штампа, иначе «Лист 28, 30»
-        mark = data.get("mark") or ("Лист " + ", ".join(str(s) for s in target_sheets))
-    else:
-        mark = data.get("mark") or data.get("drawing") or fname_mark
+    mark = data.get("mark") or mark_default or data.get("drawing") or fname_mark
 
     # количество из заявки по марке (только зелёная связка)
     qty = 1
@@ -1567,6 +1552,40 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_she
         "mass_kg": sum_mass, "control_no_weld_kg": control_noweld,
         "diff_pct": diff_pct, "check_status": cstatus,
     }
+
+
+def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_sheets=None):
+    """Распознаёт чертёж -> СПИСОК product dict (одно изделие = одна строка Расчёта).
+    Если указаны target_sheets (напр. [28, 30]) — каждый лист читается ОТДЕЛЬНЫМ
+    проходом и даёт своё изделие (своя строка). Иначе — один общий проход."""
+    import os as _os
+    images = drawing_to_images(draw_bytes, filename)
+    base = _os.path.basename(filename)
+
+    if target_sheets:
+        products = []
+        for sheet in target_sheets:
+            phase("CLAUDE_CALL", pages=len(images), file=base, model=CLAUDE_MODEL, sheet=sheet)
+            t = time.time()
+            data = extract_positions(images, target_sheets=[sheet])
+            n = len(data.get("positions") or [])
+            phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=n, sheet=sheet)
+            if n == 0:
+                # лист не найден в штампе или пуст — отдельная пометка, изделие не плодим
+                phase("SHEET_EMPTY", sheet=sheet)
+                continue
+            prod = _finalize_product(data, filename, request_items, phase,
+                                     mark_default=f"Лист {sheet}")
+            prod["sheet"] = sheet
+            products.append(prod)
+        return products
+
+    phase("CLAUDE_CALL", pages=len(images), file=base, model=CLAUDE_MODEL)
+    t = time.time()
+    data = extract_positions(images)
+    phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000),
+          positions=len(data.get("positions") or []))
+    return [_finalize_product(data, filename, request_items, phase)]
 
 
 def _safe_float(v):
@@ -1640,11 +1659,12 @@ def process_order(order_id):
             try:
                 phase("LOAD_DRAWING", file=path)
                 db = download_drawing_by_path(path) if drow else download_drawing(order)
-                prod = recognize_one_drawing(db, path or "", request_items, phase,
+                prods = recognize_one_drawing(db, path or "", request_items, phase,
                                               target_sheets=target_sheets)
-                products.append(prod)
-                # статус по каждому изделию -> в order_drawings (если запись есть)
-                if drow:
+                products.extend(prods)
+                # статус -> в order_drawings (если запись одна и изделие одно)
+                if drow and len(prods) == 1:
+                    prod = prods[0]
                     update_order_drawing(drow["id"], {
                         "mark": prod["mark"], "qty": prod["qty"],
                         "mass_kg": prod["mass_kg"], "control_kg": prod["control_no_weld_kg"],
