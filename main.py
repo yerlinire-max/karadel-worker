@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v15-mark-core-match-2026-06-20"
+WORKER_VERSION = "v16-sheet-filter-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -492,13 +492,16 @@ def _aggregate_by_sortament(positions):
     return out
 
 
-def extract_positions(images_b64):
+def extract_positions(images_b64, target_sheets=None):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     content = [
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b}}
         for b in images_b64
     ]
-    content.append({"type": "text", "text": EXTRACTION_PROMPT})
+    prompt = EXTRACTION_PROMPT
+    if target_sheets:
+        prompt = SHEET_FILTER_PREFIX.format(sheets=", ".join(str(s) for s in target_sheets)) + EXTRACTION_PROMPT
+    content.append({"type": "text", "text": prompt})
     resp = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=4096,
@@ -506,6 +509,48 @@ def extract_positions(images_b64):
     )
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
     return parse_json(text)
+
+
+# Префикс к EXTRACTION_PROMPT, когда менеджер указал конкретные листы
+# (например «посчитай лист 28, 30»). Заставляет модель читать металл ТОЛЬКО
+# со страниц, где в ШТАМПЕ стоит нужный номер листа.
+SHEET_FILTER_PREFIX = """ОГРАНИЧЕНИЕ ПО ЛИСТАМ — ВЫПОЛНИ В ПЕРВУЮ ОЧЕРЕДЬ.
+Тебя просят рассчитать ТОЛЬКО лист(ы): {sheets}.
+Номер листа написан в ШТАМПЕ чертежа (рамка справа внизу, графа «Лист»).
+Это НЕ номер страницы файла — сверяйся именно со штампом.
+ПОРЯДОК:
+1) Просмотри страницы и определи, на каких из них в штампе стоит ОДИН из номеров: {sheets}.
+2) Спецификацию металла читай ТОЛЬКО с этих страниц. Со всех остальных страниц
+   НЕ бери ни одной позиции — полностью их игнорируй.
+3) Если на нужном листе несколько изделий и у каждого своя спецификация —
+   выпиши позиции ВСЕХ изделий этого листа (не пропускай мелкие детали).
+4) Если ни на одной странице нужного номера листа в штампе нет — верни
+   "positions": [] и "control_total_kg": null. НЕ подставляй позиции с других листов.
+=====================================================================
+
+"""
+
+
+def _parse_sheet_numbers(text):
+    """Из текста заявки достаёт номера листов, если менеджер написал команду вида
+    «посчитай лист 28, 30», «листы 28 30», «лист №30», «л. 30».
+    Возвращает список строк-номеров в порядке появления, без повторов. Иначе []."""
+    if not text:
+        return []
+    t = str(text).lower().replace("ё", "е")
+    sheets = []
+    # «лист(ы/а) [№] 28, 30 [и] 31» — забираем все числа из хвоста после слова «лист»
+    for m in re.finditer(r"\bлист(?:ы|а)?\s*№?\s*([\d\s,;]+(?:\s*и\s*\d+)*)", t):
+        for num in re.findall(r"\d+", m.group(1)):
+            if num not in sheets:
+                sheets.append(num)
+    # запасной вариант «л. 30»
+    if not sheets:
+        for m in re.finditer(r"\bл\.?\s*№?\s*(\d+)", t):
+            num = m.group(1)
+            if num not in sheets:
+                sheets.append(num)
+    return sheets
 
 
 REQUEST_PROMPT = """Ты разбираешь ЗАЯВКУ заказчика на металлоконструкции (фото/скан/PDF таблицы).
@@ -1459,15 +1504,18 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
 # ---------------------------------------------------------------------------
 # Фоновая обработка
 # ---------------------------------------------------------------------------
-def recognize_one_drawing(draw_bytes, filename, request_items, phase):
+def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_sheets=None):
     """Распознаёт ОДИН чертёж -> product dict для мульти-заполнения:
        {mark, drawing, qty, positions, control_total_kg, weld_pct, check}.
-    request_items — распознанная заявка (для подстановки количества по марке)."""
+    request_items — распознанная заявка (для подстановки количества по марке).
+    target_sheets — список номеров листов (если менеджер указал «посчитай лист 28, 30»):
+       металл читается ТОЛЬКО с этих листов (по штампу)."""
     import os as _os
     images = drawing_to_images(draw_bytes, filename)
-    phase("CLAUDE_CALL", pages=len(images), file=_os.path.basename(filename), model=CLAUDE_MODEL)
+    phase("CLAUDE_CALL", pages=len(images), file=_os.path.basename(filename),
+          model=CLAUDE_MODEL, sheets=(target_sheets or None))
     t = time.time()
-    data = extract_positions(images)
+    data = extract_positions(images, target_sheets=target_sheets)
     positions = data.get("positions") or []
     phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=len(positions))
 
@@ -1478,7 +1526,11 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase):
 
     # марка изделия (для строки C и связки с заявкой)
     fname_mark = _os.path.splitext(_os.path.basename(filename))[0].replace("_", " ")
-    mark = data.get("mark") or data.get("drawing") or fname_mark
+    if target_sheets:
+        # читаем по листу: имя изделия = марка из штампа, иначе «Лист 28, 30»
+        mark = data.get("mark") or ("Лист " + ", ".join(str(s) for s in target_sheets))
+    else:
+        mark = data.get("mark") or data.get("drawing") or fname_mark
 
     # количество из заявки по марке (только зелёная связка)
     qty = 1
@@ -1554,6 +1606,10 @@ def process_order(order_id):
         # --- Заявка: текст из формы (приоритет) или файл (PDF/картинки/Word/Excel) ---
         request_items = []
         req_text = (order.get(REQUEST_TEXT_COL) or "").strip()
+        # номера листов из команды менеджера («посчитай лист 28, 30») — читаем металл только с них
+        target_sheets = _parse_sheet_numbers(req_text)
+        if target_sheets:
+            phase("SHEET_FILTER", sheets=target_sheets)
         if req_text:
             try:
                 request_items = extract_request_items_from_text(req_text).get("items", [])
@@ -1584,7 +1640,8 @@ def process_order(order_id):
             try:
                 phase("LOAD_DRAWING", file=path)
                 db = download_drawing_by_path(path) if drow else download_drawing(order)
-                prod = recognize_one_drawing(db, path or "", request_items, phase)
+                prod = recognize_one_drawing(db, path or "", request_items, phase,
+                                              target_sheets=target_sheets)
                 products.append(prod)
                 # статус по каждому изделию -> в order_drawings (если запись есть)
                 if drow:
