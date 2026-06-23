@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v17-per-sheet-2026-06-23"
+WORKER_VERSION = "v18-sheet-table-diag-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -516,16 +516,38 @@ def extract_positions(images_b64, target_sheets=None):
 # со страниц, где в ШТАМПЕ стоит нужный номер листа.
 SHEET_FILTER_PREFIX = """ОГРАНИЧЕНИЕ ПО ЛИСТАМ — ВЫПОЛНИ В ПЕРВУЮ ОЧЕРЕДЬ.
 Тебя просят рассчитать ТОЛЬКО лист(ы): {sheets}.
-Номер листа написан в ШТАМПЕ чертежа (рамка справа внизу, графа «Лист»).
-Это НЕ номер страницы файла — сверяйся именно со штампом.
+Номер листа написан в ШТАМПЕ чертежа — в рамке справа внизу, в графе «Лист»
+(она между графами «Стадия» и «Листов»). Это НЕ номер страницы файла и НЕ
+«лист NN» из столбца «Обозначение» (там это ссылка на другой чертёж). Сверяйся
+ТОЛЬКО со штампом страницы.
+
 ПОРЯДОК:
-1) Просмотри страницы и определи, на каких из них в штампе стоит ОДИН из номеров: {sheets}.
-2) Спецификацию металла читай ТОЛЬКО с этих страниц. Со всех остальных страниц
-   НЕ бери ни одной позиции — полностью их игнорируй.
-3) Если на нужном листе несколько изделий и у каждого своя спецификация —
-   выпиши позиции ВСЕХ изделий этого листа (не пропускай мелкие детали).
-4) Если ни на одной странице нужного номера листа в штампе нет — верни
-   "positions": [] и "control_total_kg": null. НЕ подставляй позиции с других листов.
+1) Просмотри ВСЕ страницы. Для каждой посмотри в штамп графу «Лист».
+2) Возьми в работу только страницу(ы), где в штампе стоит один из номеров: {sheets}.
+3) Спецификацию металла читай ТОЛЬКО с этих страниц. С остальных — ничего.
+4) Если нужного номера в штампах нет — верни "positions": [] и "control_total_kg": null.
+
+КАК ЧИТАТЬ ТАБЛИЦУ СПЕЦИФИКАЦИИ НА ЭТОМ ЛИСТЕ (столбцы:
+Поз. | Обозначение | Наименование | Кол. | Масса ед., кг | Примечание):
+- МАССА: в столбце стоит «Масса ед.» — это масса ОДНОЙ детали. Массу позиции
+  считай как mass_kg = «Масса ед.» × «Кол.». (Пример: Кол.=2, Масса ед.=83,2 → 166,4.)
+- На листе может быть НЕСКОЛЬКО изделий, разделённых строками-заголовками
+  (напр. «Площадка ПЛ1», «Накладка Н1», «Короб К1»). Выпиши позиции ВСЕХ изделий
+  этого листа — программа их сложит.
+- НЕ включай строку «Наплавленный металл» (это сварка, не сортамент).
+- НЕ включай строки-заголовки изделий и строку «Итого».
+- Сортамент (sortament) переводи как в «Сводной»:
+  • «Швеллер 12», «[12» → "Швеллер 12";  «Швеллер 8» → "Швеллер 8"
+  • «Уголок 90х7», «L90x7» → "Уголок 90x7";  «Уголок 80х6» → "Уголок 80x6";
+    «Уголок 40х4» → "Уголок 40x4"
+  • «Сталь круглая ⌀16», «ф16», «d16» → "Круг 16";  «ф6» → "Круг 6"
+  • листовая сталь «Сталь 660х3 … лист», «660x3» (толщина — наименьший размер, тут 3)
+    → "Лист 3";  «900х3 … лист» → "Лист 3"
+  • «Сетка №35 …» → "Сетка 35"
+
+ДОПОЛНИТЕЛЬНО (для диагностики) верни поле "sheets_seen" — массив ВСЕХ номеров
+листов, которые ты увидел в штампах страниц этого файла (как строки), напр.
+"sheets_seen": ["5","5.1","29","30"].
 =====================================================================
 
 """
@@ -1362,7 +1384,7 @@ def apply_catalog_to_template(xlsx_bytes, catalog):
         return xlsx_bytes
 
 
-def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None, pricelist=None, products=None):
+def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=None, pricelist=None, products=None, diag_text=None):
     zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
     parts = {n: zin.read(n) for n in zin.namelist()}
 
@@ -1376,6 +1398,10 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
     else:
         cells, notes, dopisat, summary = build_raschet_cells(
             positions, drawing_name, svod_index, price_map)
+
+    # служебная диагностика в A1 (пустая, безопасная ячейка) — версия/листы
+    if diag_text:
+        cells["A1"] = (diag_text, "s", None)
 
     # стили цветов: для каждой помечаемой ячейки клонируем ЕЁ СОБСТВЕННЫЙ стиль
     # (шрифт, перенос, рамка) и только меняем заливку — формат ячейки сохраняется
@@ -1564,20 +1590,36 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_she
 
     if target_sheets:
         products = []
+        seen_all = []
         for sheet in target_sheets:
             phase("CLAUDE_CALL", pages=len(images), file=base, model=CLAUDE_MODEL, sheet=sheet)
             t = time.time()
             data = extract_positions(images, target_sheets=[sheet])
+            seen = data.get("sheets_seen") or []
+            if seen and not seen_all:
+                seen_all = [str(s) for s in seen]
             n = len(data.get("positions") or [])
-            phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=n, sheet=sheet)
+            phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000), positions=n,
+                  sheet=sheet, sheets_seen=seen_all)
             if n == 0:
-                # лист не найден в штампе или пуст — отдельная пометка, изделие не плодим
-                phase("SHEET_EMPTY", sheet=sheet)
+                # лист не найден в штампе или пуст — пометка с тем, что реально видно
+                phase("SHEET_EMPTY", sheet=sheet, sheets_seen=seen_all)
                 continue
             prod = _finalize_product(data, filename, request_items, phase,
                                      mark_default=f"Лист {sheet}")
             prod["sheet"] = sheet
+            prod["sheets_seen"] = seen_all
             products.append(prod)
+        if not products:
+            # ни один лист не дал позиций — вернём «пустышку» с диагностикой, чтобы
+            # в результат попало, какие листы реально есть в файле
+            return [{
+                "mark": "ЛИСТ НЕ НАЙДЕН", "drawing": "", "qty": 1, "positions": [],
+                "control_total_kg": None, "weld_pct": None, "mass_kg": 0.0,
+                "control_no_weld_kg": None, "diff_pct": None,
+                "check_status": "CHECK_NO_CONTROL",
+                "sheets_seen": seen_all, "empty_sheets": [str(s) for s in target_sheets],
+            }]
         return products
 
     phase("CLAUDE_CALL", pages=len(images), file=base, model=CLAUDE_MODEL)
@@ -1686,8 +1728,14 @@ def process_order(order_id):
 
         phase("FILL_EXCEL")
         overrides = load_overrides(order_id)
+        # диагностика в A1: версия / модель / какие листы просили / что увидели в штампах
+        seen = next((p.get("sheets_seen") for p in products if p.get("sheets_seen")), [])
+        diag_text = (f"{WORKER_VERSION} | model={CLAUDE_MODEL} | "
+                     f"просили листы={target_sheets or '—'} | "
+                     f"в штампах={seen or '—'} | изделий={len(products)}")
         filled, notes, summary, per_product = fill_template(
-            tpl, [], "", overrides, catalog, pricelist, products=products)
+            tpl, [], "", overrides, catalog, pricelist, products=products, diag_text=diag_text)
+        phase("DIAG_A1", text=diag_text)
         if notes:
             phase("SVODNAYA_ANALOGS", count=len(notes), items=notes)
         review_total = summary["yellow"] + summary["orange"] + summary["red"]
