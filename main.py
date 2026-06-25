@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v23-plate-geometry-2026-06-23"
+WORKER_VERSION = "v24-plate-fix-2026-06-25"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -1703,7 +1703,7 @@ def _plate_to_product(plate, filename, request_items, phase):
         return None
     mass = round(L / 1000.0 * W / 1000.0 * S / 1000.0 * STEEL_DENSITY, 2)
     sortament = f"Лист {int(S) if float(S).is_integer() else S}"
-    phase("PLATE_CALC", name=name[:60], L=L, W=W, S=S, grade=grade,
+    phase("PLATE_CALC", det=name[:60], L=L, W=W, S=S, grade=grade,
           mass_kg=mass, sortament=sortament,
           holes=[{"d": h.get("d"), "count": h.get("count")} for h in holes])
 
