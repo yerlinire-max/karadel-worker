@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v25-qty-number-match-2026-06-25"
+WORKER_VERSION = "v27-nuts-washers-2026-06-25"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -251,6 +251,8 @@ EXTRACTION_PROMPT = """
   "weld_pct": null,
   "control_total_kg": 70103.84,
   "plate": null,
+  "bolts": [],
+  "nuts_washers": [],
   "positions": [
     {"sortament": "Швеллер 10", "grade": "С255", "mass_kg": 5803.68, "qty": 1},
     {"sortament": "Лист t10", "grade": "С345", "mass_kg": 8021.71, "qty": 1},
@@ -288,6 +290,53 @@ def idx_to_col(idx):
 
 # стальные сортаменты живут в колонках N..BA (40 штук)
 STEEL_COLUMNS = [idx_to_col(i) for i in range(col_to_idx("N"), col_to_idx("BA") + 1)]
+# Колонки болтов на листе «Расчет» (имя в строке 5, диаметр в 1, длина в 2, кол-во в строке изделия)
+BOLT_COLUMNS = [idx_to_col(i) for i in range(col_to_idx("BC"), col_to_idx("BV") + 1)]
+# Колонки гаек/шайб (имя в строке 5; цена и вес подтягиваются формулой по имени; кол-во в строке изделия)
+NUT_WASHER_COLUMNS = [idx_to_col(i) for i in range(col_to_idx("BW"), col_to_idx("CP") + 1)]
+
+
+def _parse_nut_washer(item):
+    """Гайка/шайба -> (имя 'Гайка 20'/'Шайба 20', количество, оцинк?).
+    Имя совпадает с базой «Метизы», поэтому цена и вес подтянутся формулой."""
+    typ = str(item.get("type") or item.get("name") or "").lower()
+    if "гайк" in typ:
+        kind = "Гайка"
+    elif "шайб" in typ:
+        kind = "Шайба"
+    else:
+        return None
+    size = str(item.get("size") or item.get("desig") or "")
+    m = re.search(r"(\d+(?:[.,]\d+)?)", size.replace("М", "").replace("M", ""))
+    if not m:
+        return None
+    sz = m.group(1).replace(",", ".")
+    if sz.endswith(".0"):
+        sz = sz[:-2]
+    name = f"{kind} {sz}"
+    src = (str(item.get("coating") or "") + " " + size).lower()
+    galv = bool(re.search(r"оц|цинк", src))
+    try:
+        cnt = int(round(float(item.get("count") or item.get("qty") or 0)))
+    except (TypeError, ValueError):
+        cnt = 0
+    return name, cnt, galv
+
+
+def _parse_bolt(desig, coating=None):
+    """«М20×70»/«М20х70»/«M20x70»/«М20*70» -> (диаметр 'М20', длина '70',
+    имя 'Болт М20×70'[ оцинк]). Возвращает None, если это не болт."""
+    s = str(desig or "").strip()
+    s = s.replace("M", "М").replace("x", "×").replace("х", "×").replace("*", "×").replace("X", "×")
+    m = re.search(r"М\s*(\d+)\s*×\s*(\d+)", s)
+    if not m:
+        return None
+    dia = f"М{m.group(1)}"
+    length = m.group(2)
+    src = (str(desig or "") + " " + str(coating or "")).lower()
+    oc = bool(re.search(r"оц|цинк", src))
+    name = f"Болт {dia}×{length}" + (" оцинк" if oc else "")
+    return dia, length, name
 
 
 def fetch_order(order_id):
@@ -565,6 +614,15 @@ TABLE_READ_RULES = """КАК ЧИТАТЬ ТАБЛИЦУ СПЕЦИФИКАЦИ�
   • листовая сталь «Сталь 660х3 … лист», «660x3» (толщина — наименьший размер, тут 3)
     → "Лист 3";  «900х3 … лист» → "Лист 3"
   • «Сетка №35 …» → "Сетка 35"
+- БОЛТЫ из раздела «Стандартные изделия» (если есть): верни массив "bolts" —
+  [{"desig":"М20×70","count":8,"coating":""}]. desig — диаметр×длина (М20×70).
+  count — из столбца «Кол.». coating — "оцинк", если в названии есть «оц»/«цинк»/
+  «оцинков», иначе "". Гайки и шайбы пока НЕ нужны — только болты.
+- ГАЙКИ и ШАЙБЫ из раздела «Стандартные изделия» (если есть): верни массив
+  "nuts_washers" — [{"type":"гайка","size":"20","count":8,"coating":""},
+  {"type":"шайба","size":"20","count":8,"coating":""}]. type — «гайка» или «шайба».
+  size — размер резьбы/диаметр (20). count — из «Кол.». coating — "оцинк" если
+  оцинкованные, иначе "".
 """
 
 # Режим А: страница листа УЖЕ отобрана (даны её фрагменты-тайлы). Штамп искать
@@ -1340,6 +1398,11 @@ def build_raschet_cells_multi(products, svod_index=None, price_map=None):
     col_of = {}        # _norm_key(имя) -> столбец
     mat_meta = {}      # _norm_key -> (имя, mark, comment)
     next_col = 0
+    bolt_of = {}       # имя болта -> (столбец, диаметр, длина)
+    next_bolt = 0
+    bolt_fills = []    # для диагностики
+    nw_of = {}         # ключ гайки/шайбы -> (столбец, имя, оцинк)
+    next_nw = 0
 
     ROW0 = 6
     for pi, prod in enumerate(products):
@@ -1390,6 +1453,57 @@ def build_raschet_cells_multi(products, svod_index=None, price_map=None):
         per_product.append({"row": row, "mark": mark_name, "mass": round(total, 2),
                             "qty": qty, "control": prod.get("control_total_kg"),
                             "weld_pct": prod.get("weld_pct")})
+
+        # болты этого изделия -> колонки BC..BV (кол-во в строку изделия)
+        for b in prod.get("bolts", []):
+            parsed = _parse_bolt(b.get("desig") or b.get("name"), b.get("coating"))
+            if not parsed:
+                continue
+            dia, length, bname = parsed
+            try:
+                cnt = int(round(float(b.get("count") or b.get("qty") or 0)))
+            except (TypeError, ValueError):
+                cnt = 0
+            if cnt <= 0:
+                continue
+            if bname not in bolt_of:
+                if next_bolt >= len(BOLT_COLUMNS):
+                    continue
+                bolt_of[bname] = (BOLT_COLUMNS[next_bolt], dia, length)
+                next_bolt += 1
+                bolt_fills.append({"имя": bname, "столбец": BOLT_COLUMNS[next_bolt - 1]})
+            bcol = bolt_of[bname][0]
+            cells[f"{bcol}{row}"] = (cnt, "n", None)
+
+        # гайки/шайбы этого изделия -> колонки BW..CP (имя в строку 5, кол-во в строку изделия)
+        for it in prod.get("nuts_washers", []):
+            parsed = _parse_nut_washer(it)
+            if not parsed:
+                continue
+            nwname, cnt, galv = parsed
+            if cnt <= 0:
+                continue
+            key = nwname + ("|оц" if galv else "")
+            if key not in nw_of:
+                if next_nw >= len(NUT_WASHER_COLUMNS):
+                    continue
+                nw_of[key] = (NUT_WASHER_COLUMNS[next_nw], nwname, galv)
+                next_nw += 1
+            ncol = nw_of[key][0]
+            cells[f"{ncol}{row}"] = (cnt, "n", None)
+
+    # шапки болтов (строка 5 = имя -> в Сводную; 1 = диаметр для цены; 2 = длина)
+    for bname, (bcol, dia, length) in bolt_of.items():
+        cells[f"{bcol}1"] = (dia, "s", None)
+        cells[f"{bcol}2"] = (f"L={length}мм", "s", None)
+        cells[f"{bcol}5"] = (bname, "s", None)
+
+    # шапки гаек/шайб (строка 5 = имя; цена и вес подтянутся формулой по имени)
+    for key, (ncol, nwname, galv) in nw_of.items():
+        cells[f"{ncol}5"] = (nwname, "s", None)
+        if galv:
+            # пока чёрная цена; пометка для менеджера, что метиз оцинкованный
+            cells[f"{ncol}1"] = ("оцинк", "s", None)
 
     # шапка материалов (строка 5) + комментарии (строка 1)
     for key, col in col_of.items():
@@ -1782,6 +1896,8 @@ def _finalize_product(data, filename, request_items, phase, mark_default=None):
         "control_total_kg": control, "weld_pct": weld_pct,
         "mass_kg": sum_mass, "control_no_weld_kg": control_noweld,
         "diff_pct": diff_pct, "check_status": cstatus,
+        "bolts": data.get("bolts") or [],
+        "nuts_washers": data.get("nuts_washers") or [],
     }
 
 
@@ -1819,6 +1935,10 @@ def _split_sheet_into_products(data, filename, request_items, phase, sheet, seen
         prod["sheet"] = sheet
         prod["sheets_seen"] = seen_all
         out.append(prod)
+    # болты раздела «Стандартные изделия» относятся ко всему листу — вешаем на 1-е изделие
+    if out:
+        out[0]["bolts"] = data.get("bolts") or []
+        out[0]["nuts_washers"] = data.get("nuts_washers") or []
     return out
 
 
