@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v28-metiz-readall-2026-06-25"
+WORKER_VERSION = "v29-metiz-name-norm-2026-06-25"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -1393,7 +1393,33 @@ def _resolve_one_material(raw, grade, svod_index, price_map, dopisat):
     return name, mark, comment
 
 
-def build_raschet_cells_multi(products, svod_index=None, price_map=None):
+def _norm_metiz(s):
+    """Нормализует имя метиза для сверки с базой: регистр, ё->е, БЕЗ пробелов.
+    «Шайба 24» == «Шайба24»; «Гайка 42» == «Гайка42»."""
+    return re.sub(r"\s+", "", str(s or "").lower().replace("ё", "е"))
+
+
+def read_metizy_index(xlsx_bytes):
+    """{нормализованное_имя: точное_имя_из_базы} из листа «Метизы» Расчёта (столбец B,
+    строки 4–68). Нужно, чтобы подставлять имя метиза ровно как в прайсе (учёт
+    слитного написания «Шайба24»), иначе VLOOKUP цену не найдёт."""
+    out = {}
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
+        if "Метизы" not in wb.sheetnames:
+            return out
+        ws = wb["Метизы"]
+        for r in range(4, 69):
+            v = ws[f"B{r}"].value
+            if isinstance(v, str) and v.strip():
+                out[_norm_metiz(v)] = v.strip()
+    except Exception:
+        pass
+    return out
+
+
+def build_raschet_cells_multi(products, svod_index=None, price_map=None, metiz_index=None):
     """Заполнение НЕСКОЛЬКИХ изделий: каждое — своя строка (6,7,8…),
     материалы — общие столбцы (N,O,P…) на весь заказ.
     products = [{"mark": str, "qty": int, "positions": [..]}, ...]
@@ -1511,8 +1537,10 @@ def build_raschet_cells_multi(products, svod_index=None, price_map=None):
         cells[f"{bcol}5"] = (bname, "s", None)
 
     # шапки гаек/шайб (строка 5 = имя; цена и вес подтянутся формулой по имени)
+    metiz_index = metiz_index or {}
     for key, (ncol, nwname, galv) in nw_of.items():
-        cells[f"{ncol}5"] = (nwname, "s", None)
+        exact = metiz_index.get(_norm_metiz(nwname), nwname)  # имя ровно как в базе
+        cells[f"{ncol}5"] = (exact, "s", None)
         if galv:
             # пока чёрная цена; пометка для менеджера, что метиз оцинкованный
             cells[f"{ncol}1"] = ("оцинк", "s", None)
@@ -1684,10 +1712,11 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
     entries, free_rows = read_svodnaya_full(xlsx_bytes)
     price_map = {nm: pr for _, nm, pr in entries}
     svod_index = build_svodnaya_index([nm for _, nm, _ in entries])
+    metiz_index = read_metizy_index(xlsx_bytes)
     per_product = None
     if products:
         cells, notes, dopisat, summary, per_product = build_raschet_cells_multi(
-            products, svod_index, price_map)
+            products, svod_index, price_map, metiz_index)
     else:
         cells, notes, dopisat, summary = build_raschet_cells(
             positions, drawing_name, svod_index, price_map)
