@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v22-fix-format-2026-06-23"
+WORKER_VERSION = "v23-plate-geometry-2026-06-23"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -105,6 +105,28 @@ EXTRACTION_PROMPT = """
   Применяй РАЗДЕЛ «ТИП 2» ниже.
 
 Если есть обе — бери ту, что подробнее описывает изделие на этих листах.
+
+ТИП 4 — «Деталь-пластина» (эскиз БЕЗ таблицы спецификации): нарисована ОДНА
+  деталь — пластина/лист прямоугольной формы с габаритными размерами
+  (длина, ширина) и толщиной S (напр. «S=20мм»), материал подписан (напр. 09Г2С),
+  есть отверстия с подписью «⌀<d>, <N> отв». Таблицы сортамента НЕТ.
+  Применяй РАЗДЕЛ «ТИП 4» ниже.
+
+============================ РАЗДЕЛ «ТИП 4» ============================
+(одиночная деталь-пластина из листа, эскиз без таблицы)
+
+ЦЕЛЬ: снять РАЗМЕРЫ и материал. Массу НЕ считай сам — её посчитает программа.
+Верни объект "plate" (а "positions" оставь пустым []):
+- length_mm — бОльший габарит пластины, мм (напр. 2850)
+- width_mm  — меньший габарит, мм (напр. 290)
+- thickness_mm — толщина S из подписи «S=…мм», мм (напр. 20)
+- grade — марка стали из подписи (напр. "09Г2С")
+- name — наименование детали из заголовка (напр. "Пластина боковая Гит 32")
+- holes — массив отверстий. Количество бери ИЗ ПОДПИСИ «<N> отв» (НЕ считай
+  нарисованные кружки — подпись авторитетнее). Диаметр — из «⌀<d>».
+  Пример: [{"d":18,"count":10}].
+Если деталей-пластин несколько — верни массив "plates" из таких объектов.
+Размеры читай ВНИМАТЕЛЬНО (эскиз рукописный); если цифра не читается — uncertain:true.
 
 ============================ РАЗДЕЛ «ТИП 2» ============================
 (деталировочная спецификация отправочного элемента)
@@ -228,6 +250,7 @@ EXTRACTION_PROMPT = """
   "mark": "марка изделия для ТИП 2 (напр. «Траверса Б2»); для ТИП 1 — null",
   "weld_pct": null,
   "control_total_kg": 70103.84,
+  "plate": null,
   "positions": [
     {"sortament": "Швеллер 10", "grade": "С255", "mass_kg": 5803.68, "qty": 1},
     {"sortament": "Лист t10", "grade": "С345", "mass_kg": 8021.71, "qty": 1},
@@ -1660,6 +1683,44 @@ def fill_template(xlsx_bytes, positions, drawing_name, overrides=None, catalog=N
 # ---------------------------------------------------------------------------
 # Фоновая обработка
 # ---------------------------------------------------------------------------
+STEEL_DENSITY = 7850.0  # кг/м3
+
+
+def _plate_to_product(plate, filename, request_items, phase):
+    """Из размеров пластины (ТИП 4) считает массу заготовки и собирает изделие.
+    Масса = длина×ширина×толщина×плотность (отверстия НЕ вычитаются)."""
+    import os as _os
+    L = _safe_float(plate.get("length_mm"))
+    W = _safe_float(plate.get("width_mm"))
+    S = _safe_float(plate.get("thickness_mm"))
+    grade = (plate.get("grade") or "").strip()
+    name = (plate.get("name") or "").strip() or \
+        _os.path.splitext(_os.path.basename(filename))[0].replace("_", " ")
+    holes = plate.get("holes") or []
+
+    if L <= 0 or W <= 0 or S <= 0:
+        phase("PLATE_BAD_DIMS", length_mm=L, width_mm=W, thickness_mm=S)
+        return None
+    mass = round(L / 1000.0 * W / 1000.0 * S / 1000.0 * STEEL_DENSITY, 2)
+    sortament = f"Лист {int(S) if float(S).is_integer() else S}"
+    phase("PLATE_CALC", name=name[:60], L=L, W=W, S=S, grade=grade,
+          mass_kg=mass, sortament=sortament,
+          holes=[{"d": h.get("d"), "count": h.get("count")} for h in holes])
+
+    pos = [{"sortament": sortament, "grade": grade or "09Г2С", "mass_kg": mass, "qty": 1}]
+    qty = 1
+    if request_items:
+        q, qstatus, _m = match_request_to_drawing(request_items, name)
+        if qstatus == "green" and q:
+            qty = q
+    return {
+        "mark": name, "drawing": "", "qty": qty, "positions": pos,
+        "control_total_kg": mass, "weld_pct": None,
+        "mass_kg": mass, "control_no_weld_kg": mass, "diff_pct": 0.0,
+        "check_status": "CHECK_OK", "holes": holes,
+    }
+
+
 def _finalize_product(data, filename, request_items, phase, mark_default=None):
     """Из ответа модели (data с positions/mark/control) собирает product dict
     с самопроверкой массы. mark_default — имя изделия, если в штампе марки нет."""
@@ -1821,6 +1882,20 @@ def recognize_one_drawing(draw_bytes, filename, request_items, phase, target_she
     data = extract_positions(images)
     phase("CLAUDE_DONE", ms=int((time.time() - t) * 1000),
           positions=len(data.get("positions") or []))
+
+    # ТИП 4 — деталь-пластина (эскиз без таблицы): масса по геометрии
+    plates = data.get("plates")
+    if not plates and data.get("plate"):
+        plates = [data["plate"]]
+    if plates:
+        out = []
+        for pl in plates:
+            prod = _plate_to_product(pl, filename, request_items, phase)
+            if prod:
+                out.append(prod)
+        if out:
+            return out
+
     return [_finalize_product(data, filename, request_items, phase)]
 
 
