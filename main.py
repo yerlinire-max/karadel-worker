@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v27-nuts-washers-2026-06-25"
+WORKER_VERSION = "v28-metiz-readall-2026-06-25"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -153,7 +153,10 @@ EXTRACTION_PROMPT = """
 5) Добавь поле "pos" — номер позиции из спецификации (для самопроверки полноты).
 6) СВАРКА: НЕ добавляй позицию «Сварка», НЕ включай швы в массу. Если есть строка
    «На сварку N%» — верни weld_pct=N (справочно). Иначе weld_pct=null.
-7) НЕ включай крепёж из «Ведомости монтажных метизов» (болты/гайки/шайбы).
+7) КРЕПЁЖ (болты/гайки/шайбы из «Стандартных изделий» / «Ведомости метизов»):
+   в positions и в массу НЕ включай. Но если он есть — верни его ОТДЕЛЬНО в полях
+   "bolts" и "nuts_washers" (см. РАЗДЕЛ «МЕТИЗЫ» ниже). Если метизов нет — оставь
+   эти поля пустыми [].
 8) control_total_kg = масса элемента КАК В ЧЕРТЕЖЕ (со сваркой, напр. 108.96).
    НЕ вычитай сварку сам — это сделает программа.
 9) "mark" — марка изделия из штампа (напр. "Траверса Б2").
@@ -243,6 +246,15 @@ EXTRACTION_PROMPT = """
 Дополнительно верни это контрольное число в поле "control_total_kg"
 (значение строки «Итого масса металла» В КИЛОГРАММАХ; если в шапке тонны —
 умножь на 1000; если строки нет — null).
+
+РАЗДЕЛ «МЕТИЗЫ» (болты, гайки, шайбы из «Стандартных изделий»/«Ведомости метизов»):
+- В МАССУ и в "positions" их НЕ включай. Верни отдельно:
+- "bolts": [{"desig":"М20×70","count":8,"coating":""}] — desig = диаметр×длина;
+  count = из «Кол.»; coating = "оцинк", если в названии «оц»/«цинк», иначе "".
+- "nuts_washers": [{"type":"гайка","size":"20","count":8,"coating":""},
+  {"type":"шайба","size":"20","count":8,"coating":""}] — type = «гайка»/«шайба»;
+  size = размер резьбы/диаметр; count = из «Кол.»; coating аналогично.
+- Если метизов на чертеже нет — верни "bolts": [] и "nuts_washers": [].
 
 Верни СТРОГО JSON без пояснений и markdown:
 {
@@ -1889,6 +1901,13 @@ def _finalize_product(data, filename, request_items, phase, mark_default=None):
         cstatus = "CHECK_NO_CONTROL"
     phase(cstatus, mark=str(mark)[:60], sum_mass_kg=sum_mass,
           control_no_weld_kg=control_noweld, diff_pct=diff_pct)
+
+    bolts = data.get("bolts") or []
+    nw = data.get("nuts_washers") or []
+    if bolts or nw:
+        phase("METIZ_READ", mark=str(mark)[:40], bolts=len(bolts), nuts_washers=len(nw),
+              sample=([b.get("desig") for b in bolts][:4] +
+                      [f"{x.get('type')} {x.get('size')}" for x in nw][:4]))
 
     return {
         "mark": mark, "drawing": data.get("drawing") or "",
