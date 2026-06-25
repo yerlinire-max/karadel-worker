@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 
 # Метка версии — видно по /health. Если после деплоя /health не показывает
 # этот номер, значит на сервере СТАРЫЙ файл (загрузка не доехала).
-WORKER_VERSION = "v24-plate-fix-2026-06-25"
+WORKER_VERSION = "v25-qty-number-match-2026-06-25"
 from xml.sax.saxutils import escape
 
 import fitz  # PyMuPDF
@@ -921,6 +921,20 @@ def match_request_to_drawing(request_items, drawing_mark):
         if len(core_hits) > 1:
             # несколько кандидатов с тем же ядром — не угадываем, отдаём менеджеру
             return None, "yellow", None
+
+    # 2.5) запасной: по УНИКАЛЬНОМУ числу из >=2 цифр (напр. ГИТ«32»/«52»),
+    #      когда буквы марки прочитались криво («Гчт»≈«ГИТ»). Берём, только если
+    #      такое число есть у РОВНО одной строки заявки -> надёжно (green).
+    d_nums = set(re.findall(r"\d{2,}", _norm_mark(drawing_mark)))
+    if d_nums:
+        num_hits = []
+        for it in request_items:
+            it_nums = set(re.findall(r"\d{2,}",
+                          _norm_mark(it.get("mark")) + " " + _norm_mark(it.get("name"))))
+            if d_nums & it_nums:
+                num_hits.append(it)
+        if len(num_hits) == 1:
+            return num_hits[0].get("qty"), "green", num_hits[0]
 
     # 3) запасной вариант: вхождение нормализованных строк (>=3 симв.) -> yellow
     cand = []
